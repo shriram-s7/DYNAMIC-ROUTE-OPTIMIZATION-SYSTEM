@@ -61,6 +61,7 @@ class Hub(BaseModel):
     priority_cost: float = 0.0  # Numeric weight derived from priority
     delivered: bool = False
     demand_intensity: str = "Medium"  # Low, Medium, High, Emergency - live mutable urgency
+    distance_from_trichy_km: float = 0.0  # Distance from central hub in km
     
     # HUB OWNERSHIP MODEL (TWO-STAGE CONTRACT)
     ownership_state: str = "UNASSIGNED"  # UNASSIGNED, ASSIGNED, COMPLETED
@@ -147,6 +148,8 @@ class WorldState(BaseModel):
     trucks: List[Truck] = []
     ai_decisions: List[AIDecision] = []
     simulation_running: bool = False
+    simulation_paused: bool = False  # New: Track paused state
+    simulation_speed: float = 1.0  # New: Track simulation speed
     simulation_time: float = 0.0
     initial_hubs_with_demand: List[str] = []  # Hubs that existed at simulation start for completion tracking
     simulation_phase: str = "pre_start"  # pre_start, committed, executing
@@ -155,6 +158,27 @@ class WorldState(BaseModel):
 
 world_state = WorldState()
 simulation_thread = None
+# =========================
+# INITIALIZE CENTRAL HUB IN WORLD STATE
+# =========================
+def initialize_central_hub():
+    central_hub_model = Hub(
+        id=CENTRAL_HUB["id"],
+        name=CENTRAL_HUB["name"],
+        latitude=CENTRAL_HUB["latitude"],
+        longitude=CENTRAL_HUB["longitude"],
+        demand_quantity=0,
+        demand_priority="High",
+        availability=CENTRAL_HUB["availability"],
+        delivered=True,  # Always treated as completed
+        demand_intensity="Low",
+        ownership_state=HubOwnershipState.COMPLETED,
+        owner_truck_id=None,
+        frozen_at_commit=True
+    )
+    world_state.hubs = [central_hub_model]
+
+initialize_central_hub()
 
 # =========================
 # UTILS
@@ -1172,7 +1196,11 @@ def simulation_loop():
     """
 
     while world_state.simulation_running:
-        time.sleep(1)
+        if world_state.simulation_paused:
+            time.sleep(0.2)  # Small sleep to prevent busy waiting when paused
+            continue
+        
+        time.sleep(1 / world_state.simulation_speed)
         world_state.simulation_time += 1
 
         for truck in world_state.trucks:
@@ -1613,7 +1641,26 @@ def start_sim():
 @app.post("/simulation/stop")
 def stop_sim():
     world_state.simulation_running = False
+    world_state.simulation_paused = False  # Ensure paused state is reset
     return {"message": "Simulation stopped"}
+
+
+@app.post("/simulation/pause")
+def pause_simulation():
+    world_state.simulation_paused = True
+    return {"status": "paused"}
+
+
+@app.post("/simulation/resume")
+def resume_simulation():
+    world_state.simulation_paused = False
+    return {"status": "resumed"}
+
+
+@app.post("/simulation/speed")
+def set_simulation_speed(request: dict):
+    world_state.simulation_speed = float(request["speed"])
+    return {"speed": world_state.simulation_speed}
 
 @app.get("/state")
 def get_state():
@@ -1655,6 +1702,13 @@ async def create_hub_manual(hub_data: HubCreateRequest):
     if world_state.hubs_frozen:
         raise HTTPException(status_code=400, detail="Cannot add hubs after simulation has started. Hubs are frozen.")
     
+    # Compute haversine distance from Trichy (central hub)
+    distance_from_trichy = haversine(CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"], hub_data.latitude, hub_data.longitude)
+    
+    # If distance > 220 km, reject creation
+    if distance_from_trichy > 220:
+        raise HTTPException(status_code=400, detail="Hub outside 220 km service radius")
+    
     # Create new hub
     new_hub = Hub(
         id=hub_id,
@@ -1666,7 +1720,8 @@ async def create_hub_manual(hub_data: HubCreateRequest):
         availability=hub_data.availability if hasattr(hub_data, 'availability') else 20,
         priority_cost=0.0,
         delivered=False,
-        demand_intensity="Medium"  # Default intensity
+        demand_intensity="Medium",  # Default intensity
+        distance_from_trichy_km=distance_from_trichy  # Store distance from Trichy
     )
     
     # Add to hubs list (after central hub if it exists)
@@ -1685,39 +1740,119 @@ async def create_random_hubs():  # Name kept for compatibility but creates fixed
     
     # Create fixed, deterministic hubs for testing
     fixed_hubs = [
-        {
-            "id": "H1",
-            "name": "Chennai",
-            "latitude": 13.0827,
-            "longitude": 80.2707,
-            "demand_quantity": 1,
-            "demand_priority": "High",
-            "availability": 20,
-            "priority_cost": 0.0
-        },
-        {
-            "id": "H2",
-            "name": "Coimbatore",
-            "latitude": 11.0168,
-            "longitude": 76.9558,
-            "demand_quantity": 1,
-            "demand_priority": "Medium",
-            "availability": 20,
-            "priority_cost": 0.0
-        },
-        {
-            "id": "H3",
-            "name": "Madurai",
-            "latitude": 9.9252,
-            "longitude": 78.1198,
-            "demand_quantity": 1,
-            "demand_priority": "Medium",
-            "availability": 20,
-            "priority_cost": 0.0
-        }
-    ]
+                    {
+                        "id": "H1",
+                        "name": "Thanjavur",
+                        "latitude": 10.7867,
+                        "longitude": 79.1378,
+                        "demand_quantity": 1,
+                        "demand_priority": "High",
+                        "availability": 20,
+                        "priority_cost": 0.0
+                    },
+                    {
+                        "id": "H2",
+                        "name": "Karur",
+                        "latitude": 10.9601,
+                        "longitude": 78.0766,
+                        "demand_quantity": 1,
+                        "demand_priority": "Medium",
+                        "availability": 20,
+                        "priority_cost": 0.0
+                    },
+                    {
+                        "id": "H3",
+                        "name": "Dindigul",
+                        "latitude": 10.3673,
+                        "longitude": 77.9803,
+                        "demand_quantity": 1,
+                        "demand_priority": "Medium",
+                        "availability": 20,
+                        "priority_cost": 0.0
+                    },
+                    {
+                        "id": "H4",
+                        "name": "Perambalur",
+                        "latitude": 11.2342,
+                        "longitude": 78.8803,
+                        "demand_quantity": 1,
+                        "demand_priority": "Low",
+                        "availability": 20,
+                        "priority_cost": 0.0
+                    },
+                    {
+                        "id": "H5",
+                        "name": "Ariyalur",
+                        "latitude": 11.1401,
+                        "longitude": 79.0787,
+                        "demand_quantity": 1,
+                        "demand_priority": "Low",
+                        "availability": 20,
+                        "priority_cost": 0.0
+                    },
+                    {
+                        "id": "H6",
+                        "name": "Pudukkottai",
+                        "latitude": 10.3797,
+                        "longitude": 78.8208,
+                        "demand_quantity": 1,
+                        "demand_priority": "Medium",
+                        "availability": 20,
+                        "priority_cost": 0.0
+                    },
+                    {
+                        "id": "H7",
+                        "name": "Sivaganga",
+                        "latitude": 9.8470,
+                        "longitude": 78.4809,
+                        "demand_quantity": 1,
+                        "demand_priority": "Low",
+                        "availability": 20,
+                        "priority_cost": 0.0
+                    },
+                    {
+                        "id": "H8",
+                        "name": "Virudhunagar",
+                        "latitude": 9.5851,
+                        "longitude": 77.9579,
+                        "demand_quantity": 1,
+                        "demand_priority": "Medium",
+                        "availability": 20,
+                        "priority_cost": 0.0
+                    },
+                    {
+                        "id": "H9",
+                        "name": "Salem",
+                        "latitude": 11.6643,
+                        "longitude": 78.1460,
+                        "demand_quantity": 1,
+                        "demand_priority": "High",
+                        "availability": 20,
+                        "priority_cost": 0.0
+                    },
+                    {
+                        "id": "H10",
+                        "name": "Namakkal",
+                        "latitude": 11.2194,
+                        "longitude": 78.1677,
+                        "demand_quantity": 1,
+                        "demand_priority": "Medium",
+                        "availability": 20,
+                        "priority_cost": 0.0
+                    }
+                ]
+
     
     for hub_data in fixed_hubs:
+        # Compute haversine distance from Trichy (central hub)
+        distance_from_trichy = haversine(CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"], hub_data["latitude"], hub_data["longitude"])
+        
+        # If distance > 220 km, reject creation
+        if distance_from_trichy > 220:
+            continue  # Skip this hub if outside radius
+        
+        # Add the distance to the hub data
+        hub_data["distance_from_trichy_km"] = distance_from_trichy
         hub = Hub(**hub_data)
         world_state.hubs.append(hub)
     
@@ -1870,7 +2005,11 @@ def acknowledge_instruction(truck_id: str):
 def delete_hub(hub_id: str):
     """Delete a hub"""
     if hub_id == CENTRAL_HUB["id"]:
-        raise HTTPException(status_code=400, detail="Cannot delete central hub")
+        raise HTTPException(status_code=400, detail="Central hub cannot be deleted")
+    
+    # Check if simulation has started
+    if world_state.simulation_running:
+        raise HTTPException(status_code=400, detail="Cannot delete hubs after simulation start")
     
     hub = next((h for h in world_state.hubs if h.id == hub_id), None)
     if not hub:
@@ -1890,13 +2029,16 @@ def delete_hub(hub_id: str):
                 truck.status = "idle"
                 truck.route.clear()
                 truck.full_route.clear()
+        
+        # Clean up any references in task queues
+        if truck.current_task and truck.current_task.hub_id == hub_id:
+            truck.current_task = None
+        
+        # Remove hub from future task queue
+        truck.future_task_queue = [task for task in truck.future_task_queue if task.hub_id != hub_id]
     
     # Remove hub from list
     world_state.hubs = [h for h in world_state.hubs if h.id != hub_id]
-    
-    # If simulation is running, reassign routes to account for deleted hub
-    if world_state.simulation_running:
-        assign_hubs_to_trucks()
     
     return {"message": f"Hub {hub_id} deleted"}
 
@@ -2070,11 +2212,9 @@ def override_truck_block(truck_id: str, action: str):
         return {"message": f"Road block cleared for truck {truck_id}"}
     
     elif action == "return_to_depot":
-        # Force truck to return to depot
         truck.blocked_status = None
         truck.status = "returning"
         
-        # Set route to depot
         truck.route = get_road_route(
             truck.current_latitude,
             truck.current_longitude,
@@ -2097,8 +2237,7 @@ def override_truck_block(truck_id: str, action: str):
     
     else:
         return {"error": "Invalid action. Use 'clear_road' or 'return_to_depot'"}
-
-
+        
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

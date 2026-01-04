@@ -201,6 +201,12 @@ function App() {
   // State to track if simulation has started
   const [simulationStarted, setSimulationStarted] = useState(false)
   const [commitError, setCommitError] = useState(null)
+  
+  // Simulation control state
+  const [simSpeed, setSimSpeed] = useState(1.0)
+  const [simPaused, setSimPaused] = useState(false)
+  const [showStopOverlay, setShowStopOverlay] = useState(false)
+  const [simulationTerminated, setSimulationTerminated] = useState(false)
 
   const mapContainer = useRef(null)
   const map = useRef(null)
@@ -333,7 +339,7 @@ function App() {
         return; // Exit early to prevent other handlers
       }
       
-      if (role === 'manager' && addHubMode) {
+      if (role === 'manager' && addHubMode && !simulationStarted) {
         setHubModal({
           show: true,
           mode: 'create',
@@ -356,7 +362,26 @@ function App() {
   // State for driver perspective navigation
   const [driverAutoFollow, setDriverAutoFollow] = useState(true);
   const [driverFollowTimeout, setDriverFollowTimeout] = useState(null);
-  
+useEffect(() => {
+  if (role === 'driver') {
+    // Entering Driver Follow mode
+    setDriverTruckId(null);      // MUST reset driver view selection
+    setDriverAutoFollow(false);  // Prevent leftover camera control
+  }
+
+  if (role === 'driver_perspective') {
+    // Entering Driver View mode
+    setSelectedTruck(null);      // Driver Follow selection irrelevant here
+  }
+
+  if (role === 'manager') {
+    // Manager mode should be clean
+    setSelectedTruck(null);
+    setDriverTruckId(null);
+    setDriverAutoFollow(false);
+  }
+}, [role]);
+
   // Effect to handle map interaction for driver perspective auto-follow pause
   useEffect(() => {
     if (!map.current || role !== 'driver_perspective') return;
@@ -402,7 +427,7 @@ function App() {
   }, [role, driverAutoFollow, driverFollowTimeout]);
   
   /* =========================
-     POLL BACKEND STATE
+     POLL BACKEND STATE (ALWAYS ON)
   ========================== */
   useEffect(() => {
     const interval = setInterval(async () => {
@@ -424,6 +449,16 @@ function App() {
     if (!map.current || !worldState) return
 
     /* -------- HUBS -------- */
+    // --- CLEANUP DELETED HUB MARKERS ---
+    const liveHubIds = new Set(worldState.hubs.map(h => h.id));
+    
+    Object.keys(markers.current.hubs).forEach(hubId => {
+      if (!liveHubIds.has(hubId)) {
+        markers.current.hubs[hubId].remove();
+        delete markers.current.hubs[hubId];
+      }
+    });
+    
     worldState.hubs.forEach(hub => {
       let marker = markers.current.hubs[hub.id]
       
@@ -528,8 +563,8 @@ function App() {
         if (hub.id === 'CENTRAL_DEPOT') {
           // Ensure central hub always has correct appearance
           el.innerHTML = '';
-          el.style.width = '64px';
-          el.style.height = '64px';
+          el.style.width = '48px';
+          el.style.height = '48px';
           el.style.background = '#2ecc71'; // green
           el.style.borderRadius = '50%';
           el.style.border = '4px solid #ffffff';
@@ -541,8 +576,8 @@ function App() {
 
           // inner ring for container feel
           const inner = document.createElement('div');
-          inner.style.width = '42px';
-          inner.style.height = '42px';
+          inner.style.width = '30px';
+          inner.style.height = '30px';
           inner.style.borderRadius = '50%';
           inner.style.border = '2px dashed rgba(255,255,255,0.8)';
           el.appendChild(inner);
@@ -938,7 +973,7 @@ function App() {
   // Effect for driver mode - auto-follow the assigned truck (NOT for driver_perspective)
   useEffect(() => {
     // Only run for driver role, not driver_perspective (which is handled separately)
-    if (role !== 'driver' || !driverTruckId || !worldState || !map.current || !driverAutoFollow) return;
+    if (role !== 'driver' || !driverTruckId || selectedTruck !== null || !worldState || !map.current || !driverAutoFollow) return;
     
     const truck = worldState.trucks.find(t => t.id === driverTruckId);
     
@@ -1019,6 +1054,7 @@ function App() {
       setCommitError(null)
       const response = await axios.post(`${API_BASE}/simulation/start`)
       setSimulationStarted(true)
+      setAddHubMode(false) // Turn off add hub mode after simulation starts
       console.log('Commit success:', response.data)
     } catch (error) {
       // Handle commit failure
@@ -1069,7 +1105,7 @@ function App() {
 
   const handleDeleteHub = async () => {
     if (!hubModal.hub) return
-    if (!confirm(`Are you sure you want to delete hub "${hubModal.hub.name}"?`)) return
+    if (!confirm(`Delete this hub permanently?`)) return
 
     try {
       await axios.delete(`${API_BASE}/hubs/${hubModal.hub.id}`)
@@ -1158,6 +1194,57 @@ function App() {
     }
   };
   
+  // Handler for simulation speed change
+  const handleSpeedChange = async (e) => {
+    const newSpeed = parseFloat(e.target.value);
+    setSimSpeed(newSpeed);
+    
+    try {
+      await axios.post(`${API_BASE}/simulation/speed`, { speed: newSpeed });
+    } catch (error) {
+      console.error('Error changing simulation speed:', error);
+    }
+  };
+  
+  // Handler for pause/resume simulation
+  const handlePauseResume = async () => {
+    try {
+      if (simPaused) {
+        // Resume simulation
+        await axios.post(`${API_BASE}/simulation/resume`);
+        setSimPaused(false);
+      } else {
+        // Pause simulation
+        await axios.post(`${API_BASE}/simulation/pause`);
+        setSimPaused(true);
+      }
+    } catch (error) {
+      console.error('Error controlling simulation:', error);
+    }
+  };
+  
+  // Handler for stopping the simulation
+  const handleStopSimulation = async () => {
+    if (window.confirm('Are you sure you want to stop the simulation? This action cannot be undone.')) {
+      try {
+        await axios.post(`${API_BASE}/simulation/stop`);
+        setSimulationStarted(false);
+        setSimPaused(false);
+        setSimulationTerminated(true);
+      } catch (error) {
+        console.error('Error stopping simulation:', error);
+      }
+    }
+  };
+  
+  // Add effect to stop polling when simulation is stopped
+  useEffect(() => {
+    if (!simulationStarted) {
+      // When simulation stops, we don't need to do anything special
+      // The polling continues to get the stopped state
+    }
+  }, [simulationStarted]);
+  
   // Determine which truck to display based on role
   const currentTruck = worldState?.trucks?.find(t => {
     if (role === 'driver_perspective' && driverTruckId) {
@@ -1183,53 +1270,166 @@ function App() {
   ========================== */
   return (
     <div className="map-container">
-      <div ref={mapContainer} style={{ position: 'absolute', inset: 0, cursor: placementMode ? 'crosshair' : 'default' }} />
-
-      {/* Hub Creation/Edit Modal */}
-      {hubModal.show && (
+      {simulationTerminated ? (
         <div style={{
           position: 'fixed',
-          top: 0,
-          left: 0,
-          right: 0,
-          bottom: 0,
-          backgroundColor: 'rgba(0,0,0,0.5)',
+          inset: 0,
+          backgroundColor: 'white',
           display: 'flex',
+          flexDirection: 'column',
           alignItems: 'center',
           justifyContent: 'center',
-          zIndex: 10000
-        }} onClick={() => setHubModal({ show: false, mode: 'create', hub: null, lat: null, lng: null })}>
-          <div style={{
-            backgroundColor: 'white',
-            padding: '20px',
-            borderRadius: '8px',
-            minWidth: '300px',
-            maxWidth: '400px'
-          }} onClick={(e) => e.stopPropagation()}>
-            <h3>{hubModal.mode === 'create' ? 'Create New Hub' : 'Edit Hub'}</h3>
-            {hubModal.mode === 'create' ? (
-              <HubForm
-                onSubmit={handleCreateHub}
-                onCancel={() => setHubModal({ show: false, mode: 'create', hub: null, lat: null, lng: null })}
-                initialData={{ name: '', demand_quantity: 1, demand_priority: 'Medium', availability: 100 }}
-              />
-            ) : (
-              <HubForm
-                onSubmit={handleUpdateHub}
-                onCancel={() => setHubModal({ show: false, mode: 'edit', hub: null, lat: null, lng: null })}
-                onDelete={hubModal.hub?.id !== 'CENTRAL_DEPOT' ? handleDeleteHub : null}
-                initialData={{
-                  name: hubModal.hub?.name || '',
-                  demand_quantity: hubModal.hub?.demand_quantity || 1,
-                  demand_priority: hubModal.hub?.demand_priority || 'Medium'
-                }}
-                isEdit={true}
-              />
-            )}
-          </div>
+          zIndex: 10001,
+          color: '#333',
+          textAlign: 'center'
+        }}>
+          <h1 style={{
+            fontSize: '32px',
+            margin: '0 0 20px 0',
+            color: '#2c3e50'
+          }}>
+            Simulation Completed
+          </h1>
+          <p style={{
+            fontSize: '18px',
+            margin: '0 0 30px 0',
+            maxWidth: '600px',
+            color: '#7f8c8d'
+          }}>
+            Thank you for using the AI-Based Logistics Optimization System.
+          </p>
+          <p style={{
+            fontSize: '14px',
+            color: '#95a5a6',
+            marginTop: '20px'
+          }}>
+            You may now safely close this window.
+          </p>
         </div>
+      ) : (
+        <>
+          <div ref={mapContainer} style={{ position: 'absolute', inset: 0, cursor: placementMode ? 'crosshair' : 'default' }} />
+  
+          {/* Simulation Control Bar */}
+          <div style={{
+            position: 'fixed',
+            top: '12px',
+            right: '12px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '8px',
+            padding: '10px',
+            background: 'white',
+            borderRadius: '8px',
+            boxShadow: '0 2px 10px rgba(0,0,0,0.1)',
+            zIndex: 1500
+          }}>
+            {/* Simulation Speed Slider */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <label style={{ fontSize: '12px', fontWeight: 'bold' }}>Speed:</label>
+              <input
+                type="range"
+                min="0.25"
+                max="20.0"
+                step="0.25"
+                value={simSpeed}
+                onChange={handleSpeedChange}
+                disabled={!simulationStarted}
+                style={{ width: '100px' }}
+              />
+              <span style={{ fontSize: '12px', minWidth: '30px' }}>{simSpeed}×</span>
+            </div>
+              
+            {/* Pause/Resume Button */}
+            <button
+              onClick={handlePauseResume}
+              disabled={!simulationStarted}
+              style={{
+                backgroundColor: simPaused ? '#f39c12' : '#007bff',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                padding: '6px 10px',
+                cursor: 'pointer',
+                fontSize: '12px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '4px'
+              }}
+            >
+              {simPaused ? '▶ Resume' : '⏸ Pause'}
+            </button>
+              
+            {/* Stop Simulation Button */}
+            <button
+              onClick={handleStopSimulation}
+              disabled={!simulationStarted}
+              style={{
+                backgroundColor: '#dc3545',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                padding: '6px 10px',
+                cursor: 'pointer',
+                fontSize: '12px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '4px'
+              }}
+            >
+              ⏹ Stop Simulation
+            </button>
+          </div>
+  
+          {/* Hub Creation/Edit Modal */}
+          {hubModal.show && (
+            <div style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              backgroundColor: 'rgba(0,0,0,0.5)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              zIndex: 10000
+            }} onClick={() => setHubModal({ show: false, mode: 'create', hub: null, lat: null, lng: null })}>
+              <div style={{
+                backgroundColor: 'white',
+                padding: '20px',
+                borderRadius: '8px',
+                minWidth: '300px',
+                maxWidth: '400px'
+              }} onClick={(e) => e.stopPropagation()}>
+                <h3>{hubModal.mode === 'create' ? 'Create New Hub' : 'Edit Hub'}</h3>
+                {hubModal.mode === 'create' ? (
+                  <HubForm
+                    onSubmit={handleCreateHub}
+                    onCancel={() => setHubModal({ show: false, mode: 'create', hub: null, lat: null, lng: null })}
+                    initialData={{ name: '', demand_quantity: 1, demand_priority: 'Medium', availability: 100 }}
+                  />
+                ) : (
+                  <HubForm
+                    onSubmit={handleUpdateHub}
+                    onCancel={() => setHubModal({ show: false, mode: 'edit', hub: null, lat: null, lng: null })}
+                    onDelete={!simulationStarted && hubModal.hub?.id !== 'CENTRAL_DEPOT' ? handleDeleteHub : null}
+                    initialData={{
+                      name: hubModal.hub?.name || '',
+                      demand_quantity: hubModal.hub?.demand_quantity || 1,
+                      demand_priority: hubModal.hub?.demand_priority || 'Medium'
+                    }}
+                    isEdit={true}
+                  />
+                )}
+              </div>
+            </div>
+          )}
+        </>
       )}
-
+            
       <div className="control-panel">
         <h2>🚚 Route Optimization System</h2>
 
@@ -1288,19 +1488,78 @@ function App() {
                   <button 
                     className="btn btn-secondary"
                     onClick={handleCreateRandomHubs}
+                    disabled={simulationStarted}
                     style={{
                       padding: '8px 16px',
-                      backgroundColor: '#6f42c1',
+                      backgroundColor: simulationStarted ? '#6c757d' : '#6f42c1',
                       color: 'white',
                       border: 'none',
                       borderRadius: '4px',
-                      cursor: 'pointer',
+                      cursor: simulationStarted ? 'not-allowed' : 'pointer',
                       width: '100%'
                     }}
                   >
                     🎯 Create 3 Fixed Hubs
                   </button>
                 </div>
+
+                {/* Hub List Panel - Manager only, before simulation starts */}
+                {role === 'manager' && !simulationStarted && (
+                  <div style={{ marginTop: '15px' }}>
+                    <h4>📍 Hubs</h4>
+                    <div style={{ maxHeight: '200px', overflowY: 'auto', border: '1px solid #ddd', borderRadius: '4px', padding: '10px' }}>
+                      {worldState?.hubs?.filter(h => h.id !== 'CENTRAL_DEPOT').map(hub => (
+                        <div key={hub.id} style={{ 
+                          display: 'flex', 
+                          justifyContent: 'space-between', 
+                          alignItems: 'center', 
+                          padding: '8px', 
+                          margin: '5px 0', 
+                          backgroundColor: '#f8f9fa', 
+                          borderRadius: '4px',
+                          border: '1px solid #e9ecef'
+                        }}>
+                          <span>
+                            {hub.name} ({hub.demand_quantity} units, {hub.distance_from_trichy_km?.toFixed(1) || 'N/A'} km)
+                          </span>
+                          {hub.id !== 'CENTRAL_DEPOT' ? (
+                            <button 
+                              onClick={async () => {
+                                if (window.confirm('Delete this hub permanently?')) {
+                                  try {
+                                    await axios.delete(`${API_BASE}/hubs/${hub.id}`);
+                                    // The state will be updated by the polling mechanism
+                                  } catch (error) {
+                                    console.error('Error deleting hub:', error);
+                                    alert('Failed to delete hub: ' + (error.response?.data?.detail || error.message));
+                                  }
+                                }
+                              }}
+                              style={{
+                                padding: '4px 8px',
+                                backgroundColor: '#dc3545',
+                                color: 'white',
+                                border: 'none',
+                                borderRadius: '4px',
+                                cursor: 'pointer',
+                                fontSize: '12px'
+                              }}
+                            >
+                              🗑 Delete
+                            </button>
+                          ) : (
+                            <span style={{ color: '#6c757d', fontSize: '12px' }}>🔒</span>
+                          )}
+                        </div>
+                      ))}
+                      {worldState?.hubs?.filter(h => h.id !== 'CENTRAL_DEPOT').length === 0 && (
+                        <div style={{ textAlign: 'center', color: '#6c757d', fontStyle: 'italic', padding: '10px' }}>
+                          No hubs created yet
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
 
                 <div style={{ marginTop: '10px' }}>
                   <button className="btn btn-success" onClick={startSimulation}>Start</button>
@@ -1807,8 +2066,9 @@ function HubForm({ onSubmit, onCancel, onDelete, initialData, isEdit = false }) 
               borderRadius: '4px',
               cursor: 'pointer'
             }}
+            title={!simulationStarted ? '' : 'Hubs cannot be deleted after simulation start'}
           >
-            Remove Hub
+            Delete Hub
           </button>
         )}
         <button
