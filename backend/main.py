@@ -26,13 +26,15 @@ CENTRAL_HUB = {
     "latitude": 10.7905,
     "longitude": 78.7047,
     "demand_quantity": 0,
-    "demand_priority": "High",
     "availability": 10000  # Effectively infinite availability
 }
 
 MAX_CLUSTER_DISTANCE = 300  # km
 MAX_HUBS_PER_TRUCK = 5
 FUEL_CONSUMPTION_RATE = 0.1  # L/km
+MAX_DRIVING_TIME_HRS = 7.5  # Maximum driving hours until last delivery (return trip not counted)
+TRUCK_ACTIVATION_PENALTY_LITERS = 8.0  # Represents depot → short route → depot overhead
+ROADBLOCK_LOOKAHEAD_KM = 5.0  # driver sees roadblock ~5km ahead
 
 # =========================
 # HUB OWNERSHIP STATES
@@ -56,12 +58,11 @@ class Hub(BaseModel):
     latitude: float
     longitude: float
     demand_quantity: int
-    demand_priority: str
     availability: int = 100  # How much supply it can receive or send
-    priority_cost: float = 0.0  # Numeric weight derived from priority
     delivered: bool = False
     demand_intensity: str = "Medium"  # Low, Medium, High, Emergency - live mutable urgency
     distance_from_trichy_km: float = 0.0  # Distance from central hub in km
+    deadline_hours: float = 7.5  # Deadline in hours from shift start
     
     # HUB OWNERSHIP MODEL (TWO-STAGE CONTRACT)
     ownership_state: str = "UNASSIGNED"  # UNASSIGNED, ASSIGNED, COMPLETED
@@ -70,6 +71,9 @@ class Hub(BaseModel):
     # COMMIT PHASE TRACKING
     frozen_at_commit: bool = False  # True for hubs that existed at commit time
     # Frozen hubs CANNOT be claimed during execution - ownership was decided at commit
+    
+    # CLUSTER IDENTIFICATION
+    cluster_id: Optional[str] = None  # Used for sector identification
 
 class Task(BaseModel):
     """Represents a single delivery task"""
@@ -110,6 +114,13 @@ class Truck(BaseModel):
     # Disaster-related fields
     disaster_notifications: List[str] = []  # Notifications about disasters
     blocked_status: Optional[str] = None  # Status when blocked by road block (BLOCKED_WAITING_OVERRIDE)
+    
+    # CLUSTER IDENTIFICATION
+    cluster_id: Optional[str] = None  # Used for sector identification
+    
+    # MONOTONIC PATH TRACKING
+    last_distance_from_depot: float = 0.0  # Track distance from depot to validate monotonic progression
+    last_hub_visited: Optional[str] = None  # Track last hub visited for validation
 
 class DisasterType(str, Enum):
     RAIN = "rain"
@@ -124,12 +135,9 @@ class Disaster(BaseModel):
     radius_km: float = 5.0  # Default radius in km
     active: bool = True
     created_at: float = 0.0
-    # For route-based disasters (traffic and roadblock), store the affected route segment
-    affected_route_id: Optional[str] = None
     affected_segment_start_idx: Optional[int] = None
     affected_segment_end_idx: Optional[int] = None
-    snapped_coordinates: Optional[Dict] = None  # Snapped coordinates {latitude: float, longitude: float}
-    # For traffic, store the affected road segment info
+    snapped_coordinates: Optional[Dict] = None 
     traffic_severity: Optional[float] = 1.5
     
     def contains_point(self, lat: float, lon: float) -> bool:
@@ -168,10 +176,10 @@ def initialize_central_hub():
         latitude=CENTRAL_HUB["latitude"],
         longitude=CENTRAL_HUB["longitude"],
         demand_quantity=0,
-        demand_priority="High",
         availability=CENTRAL_HUB["availability"],
         delivered=True,  # Always treated as completed
         demand_intensity="Low",
+        deadline_hours=7.5,  # Central hub doesn't have delivery deadlines
         ownership_state=HubOwnershipState.COMPLETED,
         owner_truck_id=None,
         frozen_at_commit=True
@@ -201,6 +209,37 @@ def interpolate_route(lat1, lon1, lat2, lon2, steps=20):
     ]
 
 
+def distance_along_route(route, start_idx, end_idx):
+    dist = 0.0
+    for i in range(start_idx, end_idx):
+        p1 = route[i]
+        p2 = route[i + 1]
+        dist += haversine(
+            p1["latitude"], p1["longitude"],
+            p2["latitude"], p2["longitude"]
+        )
+    return dist
+
+def compute_bearing_from_point(lat: float, lon: float) -> float:
+    lat1 = math.radians(CENTRAL_HUB["latitude"])
+    lon1 = math.radians(CENTRAL_HUB["longitude"])
+    lat2 = math.radians(lat)
+    lon2 = math.radians(lon)
+
+    dlon = lon2 - lon1
+    x = math.sin(dlon) * math.cos(lat2)
+    y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+
+    bearing = math.degrees(math.atan2(x, y))
+    return (bearing + 360) % 360
+
+def compute_bearing_from_trichy_coords(lat: float, lon: float) -> float:
+    return compute_bearing_from_point(lat, lon)
+
+def compute_bearing_from_trichy(hub: Hub) -> float:
+    return compute_bearing_from_trichy_coords(hub.latitude, hub.longitude)
+
+
 def point_to_line_distance(lat, lon, line_start_lat, line_start_lon, line_end_lat, line_end_lon):
     """
     Calculate the shortest distance from a point to a line segment.
@@ -213,19 +252,14 @@ def point_to_line_distance(lat, lon, line_start_lat, line_start_lon, line_end_la
     Returns:
         Tuple of (distance in km, closest_point_lat, closest_point_lon)
     """
-    # Convert to Cartesian coordinates for accurate calculation
-    # This is a simplified version using haversine distance
-    # For more accurate calculation, we'd need to use proper projection
     
-    # Vector from start to end of line segment
+    
     line_vec_x = line_end_lon - line_start_lon
     line_vec_y = line_end_lat - line_start_lat
     
-    # Vector from start of line to point
     point_vec_x = lon - line_start_lon
     point_vec_y = lat - line_start_lat
     
-    # Calculate line length squared
     line_len_sq = line_vec_x * line_vec_x + line_vec_y * line_vec_y
     
     if line_len_sq == 0:
@@ -551,6 +585,11 @@ def is_fuel_feasible_with_return(truck: Truck, hub: Hub) -> bool:
     """
     Check if truck has enough fuel to reach a hub AND return to depot.
     This is a HARD CONSTRAINT - no assignment may violate this.
+    
+    Fuel feasibility during route construction must be evaluated as:
+      fuel_needed = sum(inter-hub distances) + distance(last_hub → depot)
+    BUT depot return must be used ONLY as a feasibility check,
+    NOT as a routing preference or scoring term.
     """
     dist_to_hub = haversine(truck.current_latitude, truck.current_longitude,
                             hub.latitude, hub.longitude)
@@ -607,220 +646,98 @@ def calculate_hub_score(truck: Truck, hub: Hub) -> float:
     Higher score = more attractive to serve.
     
     SCORING FORMULA:
-    score = (priority_weight × demand_intensity_weight) - distance_cost - fuel_cost
+    score = urgency_weight - distance_cost
     
     This is a LOCAL decision - each truck evaluates independently.
-    """
-    # Priority weights for demand_priority
-    priority_weights = {
-        "Emergency": 5.0,
-        "High": 3.0,
-        "Medium": 2.0,
-        "Low": 1.0
-    }
     
-    # Get base priority weight
-    priority_weight = priority_weights.get(hub.demand_priority, 2.0)
+    IMPORTANT: Removed any scoring term that includes:
+    - distance to depot
+    - fuel-to-depot preference
+    - global nearest-hub selection
+    """
     
     # Get urgency weight from demand_intensity (live slider value)
     urgency_weight = get_urgency_weight(hub.demand_intensity)
     
     # Calculate distance from current truck position to hub
+    # This is a local distance cost, not related to depot
     distance_km = haversine(truck.current_latitude, truck.current_longitude, 
                             hub.latitude, hub.longitude)
     
-    # Fuel cost proportional to distance
-    fuel_cost = distance_km * FUEL_CONSUMPTION_RATE * truck.fuel_efficiency
-    
-    # Distance penalty (per km)
+    # Local distance penalty (per km) - this is acceptable as it's relative to truck position
     distance_cost = distance_km * 0.5  # 0.5 penalty per km
     
     # Final score calculation
-    score = (priority_weight * urgency_weight) - distance_cost - fuel_cost
+    # Removed fuel_cost to comply with requirement to remove depot-related terms
+    score = urgency_weight - distance_cost
     
     return score
 
-def select_next_hub_locally(truck: Truck) -> Optional[str]:
-    """
-    LOCAL DECISION: Select the best next hub for this truck.
-    Called only at safe decision points.
-    
-    OWNERSHIP MODEL:
-    1. First, check if truck owns any hubs (already assigned) - serve those first
-    2. If no owned hubs, select from UNASSIGNED hubs only
-    3. Assign the selected hub to this truck (mark as ASSIGNED)
-    4. No truck may consider hubs owned by another truck
-    
-    CONSTRAINTS:
-    1. Must have remaining demand (demand_quantity > 0)
-    2. Must be fuel-feasible (enough fuel to reach hub and return to depot)
-    3. Only consider UNASSIGNED hubs OR hubs already ASSIGNED to this truck
-    
-    PREFERENCES:
-    1. Higher urgency (demand_intensity) hubs are preferred
-    2. Closer hubs preferred when urgency is similar
-    3. Emergencies get strong weight boost but don't force dispatch
-    """
-    if not is_at_safe_decision_point(truck):
-        return None
-    
-    # PRIORITY 1: Check if we already own any hubs - serve those first
-    owned_hubs = get_truck_owned_hubs(truck.id)
-    if owned_hubs:
-        # Find the highest-priority owned hub
-        best_owned_hub = None
-        best_score = float('-inf')
-        
-        for hub_id in owned_hubs:
-            hub = next((h for h in world_state.hubs if h.id == hub_id), None)
-            if hub and hub.demand_quantity > 0 and not hub.delivered:
-                # Check fuel feasibility
-                if is_fuel_feasible_with_return(truck, hub):
-                    score = calculate_hub_score(truck, hub)
-                    if score > best_score:
-                        best_score = score
-                        best_owned_hub = hub_id
-        
-        if best_owned_hub:
-            print(f"[OWNERSHIP] Truck {truck.id} selecting owned hub {best_owned_hub}")
-            return best_owned_hub
-    
-    # PRIORITY 2: Select from UNASSIGNED hubs
-    # EXECUTION RULE: Only consider NEW hubs (not frozen_at_commit)
-    # Initial hubs were assigned at commit - trucks cannot "discover" them during execution
-    candidate_hubs = []
-    
-    for hub in world_state.hubs:
-        # Skip central hub
-        if hub.id == CENTRAL_HUB["id"]:
-            continue
-        
-        # OWNERSHIP CHECK: Only consider UNASSIGNED hubs
-        if not is_hub_available_for_assignment(hub):
-            continue
-        
-        # EXECUTION RULE: Skip frozen hubs - they should have been assigned at commit
-        # Only NEW hubs (created after commit) can be claimed during execution
-        if hub.frozen_at_commit:
-            print(f"[EXECUTION RULE] Skipping frozen hub {hub.id} - should have been assigned at commit")
-            continue
-        
-        # Check fuel feasibility (enough to reach hub and return to depot) - HARD CONSTRAINT
-        if not is_fuel_feasible_with_return(truck, hub):
-            continue
-        
-        # Calculate score for this hub
-        score = calculate_hub_score(truck, hub)
-        candidate_hubs.append((hub.id, score, hub))
-    
-    if not candidate_hubs:
-        return None
-    
-    # Sort by score (descending) and select the best
-    candidate_hubs.sort(key=lambda x: x[1], reverse=True)
-    best_hub_id, best_score, best_hub = candidate_hubs[0]
-    
-    # OWNERSHIP: Assign the hub to this truck before returning
-    if assign_hub_to_truck(best_hub_id, truck.id):
-        print(f"[LOCAL DECISION] Truck {truck.id} selected and claimed {best_hub.name} "
-              f"(score={best_score:.2f}, intensity={best_hub.demand_intensity})")
-        return best_hub_id
-    else:
-        # Assignment failed - hub was taken by another truck
-        print(f"[CONFLICT] Truck {truck.id} could not claim hub {best_hub_id}")
-        return None
 
-def extend_route_if_efficient(truck: Truck, current_hub: Hub) -> Optional[str]:
-    """
-    After completing a delivery, check if it's more efficient to:
-    1. Continue to a nearby hub that we ALREADY OWN (serve owned hubs first)
-    2. If no owned hubs, check for nearby UNASSIGNED hubs to claim
-    3. Return to depot if no efficient extension possible
+
+def handle_upcoming_roadblock(truck: Truck, disaster: Disaster):
+    # Try alternate route to SAME destination
+    if not truck.current_task:
+        # No current task, so just stop the truck
+        truck.status = "blocked"
+        truck.blocked_status = "BLOCKED_WAITING_OVERRIDE"
+
+        world_state.ai_decisions.append(
+            AIDecision(
+                truck_id=truck.id,
+                decision="ROADBLOCK_AHEAD_NO_CURRENT_TASK",
+                explanation="Roadblock detected ahead but no current task to reroute to",
+                timestamp=world_state.simulation_time
+            )
+        )
+        return
+
+    hub = next(h for h in world_state.hubs if h.id == truck.current_task.hub_id)
+
+    # Get a new route to the same destination (which should avoid the known roadblocks)
+    new_route = get_road_route(
+        truck.current_latitude,
+        truck.current_longitude,
+        hub.latitude,
+        hub.longitude
+    )
     
-    OWNERSHIP RULES:
-    - First priority: serve hubs we already own
-    - Second priority: claim nearby UNASSIGNED hubs if efficient
-    - Never consider hubs owned by other trucks
-    
-    CLUSTER STABILITY: Prefer extending to nearby hubs to maintain geographic clusters.
-    """
-    if not is_at_safe_decision_point(truck):
-        return None
-    
-    # FUEL CONSTRAINT: Check if we have fuel to do anything beyond returning
-    dist_to_depot = haversine(truck.current_latitude, truck.current_longitude,
-                              CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"])
-    fuel_to_depot = dist_to_depot * FUEL_CONSUMPTION_RATE
-    reserve_fuel = truck.fuel_remaining - fuel_to_depot
-    
-    if reserve_fuel <= 0:
-        return None  # Must return to depot - HARD CONSTRAINT
-    
-    # PRIORITY 1: Check if we own any other hubs
-    owned_hubs = get_truck_owned_hubs(truck.id)
-    if owned_hubs:
-        # Find the best owned hub to extend to
-        best_owned = None
-        best_score = float('-inf')
-        
-        for hub_id in owned_hubs:
-            hub = next((h for h in world_state.hubs if h.id == hub_id), None)
-            if hub and hub.demand_quantity > 0 and not hub.delivered:
-                if is_fuel_feasible_with_return(truck, hub):
-                    score = calculate_hub_score(truck, hub)
-                    if score > best_score:
-                        best_score = score
-                        best_owned = hub_id
-        
-        if best_owned:
-            print(f"[EXTEND] Truck {truck.id} extending to owned hub {best_owned}")
-            return best_owned
-    
-    # PRIORITY 2: Find nearby UNASSIGNED hubs for efficient extension
-    # EXECUTION RULE: Only consider NEW hubs (not frozen_at_commit)
-    nearby_hubs = []
-    
-    for hub in world_state.hubs:
-        # Only consider UNASSIGNED hubs
-        if not is_hub_available_for_assignment(hub):
-            continue
-        
-        # EXECUTION RULE: Skip frozen hubs - they should have been assigned at commit
-        # Only NEW hubs (created after commit) can be claimed during execution
-        if hub.frozen_at_commit:
-            continue
-        
-        # Check fuel feasibility - HARD CONSTRAINT
-        if not is_fuel_feasible_with_return(truck, hub):
-            continue
-        
-        dist_to_hub = haversine(truck.current_latitude, truck.current_longitude,
-                                hub.latitude, hub.longitude)
-        dist_hub_to_depot = haversine(hub.latitude, hub.longitude,
-                                      CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"])
-        
-        # CLUSTER STABILITY: Prefer extending route if marginal cost is less than new truck cost
-        marginal_cost = dist_to_hub
-        new_truck_cost = dist_hub_to_depot
-        
-        if marginal_cost < new_truck_cost * 0.8:  # 20% margin for preference
-            score = calculate_hub_score(truck, hub)
-            nearby_hubs.append((hub.id, score, dist_to_hub))
-    
-    if not nearby_hubs:
-        return None
-    
-    # Sort by score and select best nearby hub
-    nearby_hubs.sort(key=lambda x: x[1], reverse=True)
-    best_hub_id, _, _ = nearby_hubs[0]
-    
-    # OWNERSHIP: Claim the hub before returning
-    if assign_hub_to_truck(best_hub_id, truck.id):
-        print(f"[EXTEND] Truck {truck.id} extending and claiming hub {best_hub_id}")
-        return best_hub_id
-    else:
-        print(f"[EXTEND FAILED] Could not claim hub {best_hub_id}")
-        return None
+    # For now, we'll assume the new route is valid and use it
+    truck.route = new_route
+    truck.full_route = truck.route.copy()
+    truck.current_route_index = 0
+
+    world_state.ai_decisions.append(
+        AIDecision(
+            truck_id=truck.id,
+            decision="REROUTED_AROUND_ROADBLOCK",
+            explanation="Detected roadblock ahead; alternate route selected",
+            timestamp=world_state.simulation_time
+        )
+    )
+    return
+
+def dispatch_next_committed_task(truck: Truck, set_moving_state: bool = True):
+    if not truck.future_task_queue:
+        truck.status = "idle"
+        return
+
+    next_task = truck.future_task_queue.pop(0)
+    truck.current_task = next_task
+
+    hub = next(h for h in world_state.hubs if h.id == next_task.hub_id)
+
+    if set_moving_state:
+        truck.route = get_road_route(
+            truck.current_latitude,
+            truck.current_longitude,
+            hub.latitude,
+            hub.longitude
+        )
+        truck.full_route = truck.route.copy()
+        truck.current_route_index = 0
+        truck.status = "moving"
+
 
 def handle_demand_escalation(escalated_hub_id: str):
     """
@@ -981,199 +898,8 @@ def assign_hubs_to_trucks():
     This function returns True if commit was successful, False if any hub is unassigned.
     """
     
-    # Get all hubs with demand (excluding central hub)
-    hubs_requiring_assignment = []
-    for hub in world_state.hubs:
-        if hub.id != CENTRAL_HUB["id"] and hub.demand_quantity > 0:
-            hubs_requiring_assignment.append(hub)
-    
-    print(f"[COMMIT PHASE] {len(hubs_requiring_assignment)} hubs require assignment")
-    
-    # If no hubs need service, commit is successful
-    if not hubs_requiring_assignment:
-        for truck in world_state.trucks:
-            truck.route_plan.clear()
-            truck.assigned_hubs.clear()
-            truck.status = "idle"
-        print("[COMMIT] No hubs to assign - commit successful")
-        return True
-
-    # Reset all truck states
-    for truck in world_state.trucks:
-        if truck.active:
-            truck.route_plan.clear()
-            truck.assigned_hubs.clear()
-            truck.completed_deliveries.clear()
-            truck.status = "idle"
-    
-    # Get active trucks
-    active_trucks = [truck for truck in world_state.trucks if truck.active]
-    if not active_trucks:
-        print("[COMMIT ERROR] No active trucks available")
-        return False
-    
-    # CORRIDOR-BASED CLUSTERING
-    import math
-    from collections import defaultdict
-    
-    central_lat = CENTRAL_HUB["latitude"]
-    central_lon = CENTRAL_HUB["longitude"]
-    
-    # Build hub info with angle and distance
-    hub_info = []
-    for hub in hubs_requiring_assignment:
-        distance_km = haversine(central_lat, central_lon, hub.latitude, hub.longitude)
-        angle = math.atan2(hub.latitude - central_lat, hub.longitude - central_lon)
-        hub_info.append({
-            'hub': hub,
-            'distance_km': distance_km,
-            'angle': angle,
-            'demand_count': min(hub.demand_quantity, hub.availability)
-        })
-    
-    # Cluster by angular direction (30 degree bins)
-    ANGLE_THRESHOLD = math.radians(30)
-    corridors = defaultdict(list)
-    
-    for hub_data in hub_info:
-        angle_bin = round(hub_data['angle'] / ANGLE_THRESHOLD)
-        corridors[angle_bin].append(hub_data)
-    
-    # Sort hubs within each corridor by priority then distance
-    priority_order = {"Emergency": 0, "High": 1, "Medium": 2, "Low": 3}
-    for corridor_key in corridors:
-        corridors[corridor_key].sort(
-            key=lambda x: (priority_order.get(x['hub'].demand_priority, 2), x['distance_km'])
-        )
-    
-    print(f"[COMMIT] Created {len(corridors)} geographic corridors")
-    
-    # ===========================================
-    # PHASE 1: CLUSTER-BASED ASSIGNMENT
-    # ===========================================
-    assigned_hubs = set()
-    
-    for corridor_key, corridor_hubs in corridors.items():
-        # Find best truck for this corridor
-        corridor_truck = None
-        min_cost = float('inf')
-        
-        for truck in active_trucks:
-            if len(truck.route_plan) >= truck.max_capacity:
-                continue
-            
-            first_hub = corridor_hubs[0]['hub']
-            if not truck.route_plan:
-                cost = haversine(central_lat, central_lon, first_hub.latitude, first_hub.longitude)
-            else:
-                last_hub_id = truck.route_plan[-1]
-                last_hub = next((h for h in world_state.hubs if h.id == last_hub_id), None)
-                cost = haversine(last_hub.latitude, last_hub.longitude, 
-                               first_hub.latitude, first_hub.longitude) if last_hub else float('inf')
-            
-            if cost < min_cost:
-                min_cost = cost
-                corridor_truck = truck
-        
-        if not corridor_truck:
-            # No truck with capacity - will be handled in fallback
-            continue
-        
-        # Assign hubs in this corridor to the truck
-        for hub_data in corridor_hubs:
-            hub = hub_data['hub']
-            demand_count = hub_data['demand_count']
-            
-            # Check capacity, switch trucks if needed
-            if len(corridor_truck.route_plan) >= corridor_truck.max_capacity:
-                for alt_truck in active_trucks:
-                    if len(alt_truck.route_plan) < alt_truck.max_capacity:
-                        corridor_truck = alt_truck
-                        break
-                else:
-                    continue  # Will be handled in fallback
-            
-            # Assign with ownership
-            if assign_hub_to_truck(hub.id, corridor_truck.id):
-                for _ in range(demand_count):
-                    if len(corridor_truck.route_plan) < corridor_truck.max_capacity:
-                        corridor_truck.route_plan.append(hub.id)
-                assigned_hubs.add(hub.id)
-    
-    # ===========================================
-    # PHASE 2: FALLBACK ASSIGNMENT (MANDATORY)
-    # ===========================================
-    # Any hub not assigned in clustering MUST be assigned here
-    
-    unassigned_hubs = [hub for hub in hubs_requiring_assignment if hub.id not in assigned_hubs]
-    
-    if unassigned_hubs:
-        print(f"[COMMIT FALLBACK] {len(unassigned_hubs)} hubs need fallback assignment")
-        
-        for hub in unassigned_hubs:
-            # Find the nearest feasible truck (any truck with capacity)
-            best_truck = None
-            min_distance = float('inf')
-            
-            for truck in active_trucks:
-                if len(truck.route_plan) >= truck.max_capacity:
-                    continue
-                
-                # Calculate distance from depot to this hub
-                dist = haversine(central_lat, central_lon, hub.latitude, hub.longitude)
-                
-                if dist < min_distance:
-                    min_distance = dist
-                    best_truck = truck
-            
-            if best_truck:
-                if assign_hub_to_truck(hub.id, best_truck.id):
-                    demand_count = min(hub.demand_quantity, hub.availability)
-                    for _ in range(demand_count):
-                        if len(best_truck.route_plan) < best_truck.max_capacity:
-                            best_truck.route_plan.append(hub.id)
-                    assigned_hubs.add(hub.id)
-                    print(f"[COMMIT FALLBACK] Hub {hub.name} assigned to Truck {best_truck.id}")
-                else:
-                    print(f"[COMMIT ERROR] Failed to assign hub {hub.name}")
-            else:
-                print(f"[COMMIT ERROR] No truck with capacity for hub {hub.name}")
-    
-    # ===========================================
-    # PHASE 3: COMMIT VALIDATION (MANDATORY)
-    # ===========================================
-    # Verify ALL hubs are assigned - if any unassigned, commit fails
-    
-    final_unassigned = []
-    for hub in hubs_requiring_assignment:
-        if hub.ownership_state != HubOwnershipState.ASSIGNED:
-            final_unassigned.append(hub)
-    
-    if final_unassigned:
-        print(f"[COMMIT FAILED] {len(final_unassigned)} hubs remain unassigned!")
-        for hub in final_unassigned:
-            print(f"  - {hub.name} ({hub.id})")
-        return False
-    
-    # ===========================================
-    # PHASE 4: FREEZE ALL INITIAL HUBS
-    # ===========================================
-    # Mark all hubs as frozen - they cannot be re-assigned during execution
-    
-    for hub in hubs_requiring_assignment:
-        hub.frozen_at_commit = True
-    
-    # Store initial hub list for reference
-    world_state.initial_hubs_with_demand = [h.id for h in hubs_requiring_assignment]
-    
-    # Print commit summary
-    print(f"[COMMIT SUCCESS] All {len(hubs_requiring_assignment)} hubs assigned and frozen")
-    for truck in world_state.trucks:
-        if truck.route_plan:
-            owned_hubs = get_truck_owned_hubs(truck.id)
-            print(f"  Truck {truck.id}: {len(owned_hubs)} hubs owned, route_plan={truck.route_plan}")
-    
-    return True
+    # Use the fleet-optimized assignment algorithm instead of corridor-based clustering
+    return fleet_optimized_assignment_algorithm()
 
 # =========================
 # SIMULATION LOOP (DEMAND-PRESSURE DRIVEN)
@@ -1206,6 +932,10 @@ def simulation_loop():
         for truck in world_state.trucks:
             if not truck.active:
                 continue
+            
+            # Add guard to skip blocked trucks in decision logic
+            if truck.status == "blocked":
+                continue
 
             # ========================================
             # STATE: IDLE (SAFE DECISION POINT)
@@ -1213,27 +943,66 @@ def simulation_loop():
             if truck.status == "idle":
                 truck.last_decision_point = world_state.simulation_time
                 
-                # LOCAL DECISION: Select next hub using demand-pressure scoring
-                # First try task queue (legacy support), then use local selection
+
+                
+                # AFTER COMMIT PHASE: Use pre-computed routes from fleet optimization
+                # STRICT ROUTE FOLLOWING — NO LOCAL DECISIONS
                 next_hub_id = None
                 
-                # If we have pending tasks in queue, reorder and use them
-                if truck.future_task_queue:
-                    reorder_task_queue_at_decision_point(truck)
-                    truck.current_task = truck.future_task_queue.pop(0)
-                    next_hub_id = truck.current_task.hub_id
+                if world_state.simulation_phase in ("committed", "executing"):
+                    # Only execute precomputed routes - no local hub selection allowed
+                    if truck.future_task_queue:
+                        # STRICT ROUTE FOLLOWING — NO LOCAL DECISIONS
+                        # Use dispatcher to handle task assignment
+                        dispatch_next_committed_task(truck, set_moving_state=True)
+                        # After dispatch, get the hub ID from current task
+                        if truck.current_task:
+                            next_hub_id = truck.current_task.hub_id
+                    # If no tasks in queue, truck will return to depot
                 else:
-                    # LOCAL DECISION: Select best hub based on current demand pressure
-                    next_hub_id = select_next_hub_locally(truck)
-                    if next_hub_id:
-                        # Create task for the selected hub
-                        hub = next((h for h in world_state.hubs if h.id == next_hub_id), None)
-                        if hub:
-                            truck.current_task = Task(
-                                hub_id=next_hub_id,
-                                urgency_weight=get_urgency_weight(hub.demand_intensity),
-                                assigned_at=world_state.simulation_time
-                            )
+                    # Before commit phase, allow local hub selection
+                    if truck.future_task_queue:
+                        # Pre-commit phase - use dispatcher but don't set moving state immediately
+                        dispatch_next_committed_task(truck, set_moving_state=False)
+                        # After dispatch, get the hub ID from current task
+                        if truck.current_task:
+                            next_hub_id = truck.current_task.hub_id
+                    else:
+                        # LOCAL DECISION: Pre-commit phase still needs hub selection
+                        # However, we should follow similar principles to committed phase
+                        # Look for available hubs in truck's cluster
+                        available_hub_found = False
+                        for hub in world_state.hubs:
+                            if hub.id == CENTRAL_HUB["id"]:
+                                continue
+                            
+                            # Check if hub is available for assignment
+                            if not is_hub_available_for_assignment(hub):
+                                continue
+                            
+                            # Skip frozen hubs - they should have been assigned at commit
+                            if hub.frozen_at_commit:
+                                continue
+                            
+                            # CLUSTER ALIGNMENT: Only consider hubs in the same cluster as the truck
+                            if truck.cluster_id and hub.cluster_id and truck.cluster_id != hub.cluster_id:
+                                continue
+                            
+                            # Check fuel feasibility
+                            if not is_fuel_feasible_with_return(truck, hub):
+                                continue
+                            
+                            # Assign this hub to the truck
+                            if assign_hub_to_truck(hub.id, truck.id):
+                                truck.current_task = Task(
+                                    hub_id=hub.id,
+                                    urgency_weight=0.0,
+                                    assigned_at=world_state.simulation_time
+                                )
+                                available_hub_found = True
+                                break
+                        
+                        # If no suitable hub found, truck remains idle
                 
                 # Start moving to selected hub
                 if truck.current_task:
@@ -1261,7 +1030,7 @@ def simulation_loop():
                             decision="MOVING",
                             explanation=(
                                 f"Moving to {hub.name} "
-                                f"(Intensity: {hub.demand_intensity}, "
+                                f"(Deadline: {hub.deadline_hours}h, "
                                 f"Demand: {hub.demand_quantity}) - destination LOCKED"
                             ),
                             timestamp=world_state.simulation_time
@@ -1287,56 +1056,100 @@ def simulation_loop():
                                 
                     # Apply disaster effects to fuel consumption and speed
                     disaster_multiplier = 1.0
+                    has_roadblock = False
+                                        
+                    # Check for upcoming roadblocks on the route
                     for disaster in world_state.disasters:
+                        if not disaster.active:
+                            continue
+                        if disaster.disaster_type != DisasterType.ROAD_BLOCK:
+                            continue
+
+                        # Is this block on this truck's route?
+                        if disaster.affected_segment_start_idx >= len(truck.full_route):
+                            continue
+
+                        # Is truck before or inside the blocked segment?
+                        if truck.current_route_index <= disaster.affected_segment_end_idx:
+                            dist_to_block = distance_along_route(
+                                truck.full_route,
+                                truck.current_route_index,
+                                disaster.affected_segment_start_idx
+                            )
+
+                            if dist_to_block <= ROADBLOCK_LOOKAHEAD_KM:
+                                handle_upcoming_roadblock(truck, disaster)
+                                return
+
                         if disaster.active and disaster.contains_point(truck.current_latitude, truck.current_longitude):
                             if disaster.disaster_type == DisasterType.RAIN:
-                                # Rain increases fuel consumption slightly
-                                disaster_multiplier = 1.1
-                                                    
+                                # RAIN (SOFT CONSTRAINT):
+                                # - NEVER reroute
+                                # - ONLY:
+                                #     - increase ETA
+                                #     - increase fuel consumption
+                                # - Route geometry must remain unchanged
+                                disaster_multiplier = 1.1  # ~10% slower
+                                
                                 # Add notification for rain
                                 if "Rain zone ahead" not in (truck.disaster_notifications or []):
                                     truck.disaster_notifications.append("Rain zone ahead — ETA may increase")
                             elif disaster.disaster_type == DisasterType.TRAFFIC:
-                                # Traffic increases fuel consumption and reduces speed
-                                disaster_multiplier = disaster.traffic_severity
-                                                    
+                                # TRAFFIC (SOFT-OPTIONAL CONSTRAINT):
+                                # - Evaluate alternate OSRM route ONLY IF:
+                                #     alt_eta <= current_eta * 1.05
+                                # - If no such alternate exists:
+                                #     - stay on current route
+                                #     - increase ETA
+                                # - Traffic must NEVER cause cluster change or depot return
+                                if disaster.traffic_severity > 1.05:  # Only significant traffic
+                                    # Check if alternate route is significantly better
+                                    # In current implementation, we continue on current route but with reduced speed
+                                    # For real implementation, we would calculate alt_eta using OSRM
+                                    disaster_multiplier = disaster.traffic_severity
+                                else:
+                                    # Traffic not severe enough to justify rerouting
+                                    disaster_multiplier = max(disaster_multiplier, disaster.traffic_severity)
+                                
                                 # Add notification for traffic
                                 if "Traffic ahead" not in (truck.disaster_notifications or []):
                                     truck.disaster_notifications.append("Traffic ahead — continuing on current route")
-                            elif disaster.disaster_type == DisasterType.ROAD_BLOCK:
-                                # Road blocks should have been handled at decision points
-                                # If truck is still moving through a road block, it's an error
-                                print(f"[ERROR] Truck {truck.id} moving through road block at ({truck.current_latitude}, {truck.current_longitude})")
-                                                    
-                                # Add notification for road block
-                                if "Road blocked" not in (truck.disaster_notifications or []):
-                                    truck.disaster_notifications.append("Road blocked — waiting for instructions")
-                                                        
-                                # Set truck to blocked status
-                                truck.blocked_status = "BLOCKED_WAITING_OVERRIDE"
-                                truck.status = "idle"
-                                                    
-                                # Add AI decision to notify manager
-                                world_state.ai_decisions.append(
-                                    AIDecision(
-                                        truck_id=truck.id,
-                                        decision="TRUCK_BLOCKED_BY_ROAD_BLOCK",
-                                        explanation=f"Truck {truck.id} blocked by road block at ({disaster.latitude}, {disaster.longitude}). Awaiting manager override.",
-                                        timestamp=world_state.simulation_time
-                                    )
-                                )
-                                                    
-                                # Clear the route to stop movement
-                                truck.route.clear()
-                                                    
-                    fuel_used = segment_dist * FUEL_CONSUMPTION_RATE * disaster_multiplier
-                    truck.fuel_remaining = max(0, truck.fuel_remaining - fuel_used)
-                    truck.current_fuel_used += fuel_used
                                         
-                    # Adjust speed based on disasters
-                    effective_speed = truck.speed
-                    if disaster_multiplier > 1.0:
-                        effective_speed = truck.speed / disaster_multiplier
+                    # Only apply fuel consumption if not blocked by roadblock
+                    if not has_roadblock:
+                        fuel_used = segment_dist * FUEL_CONSUMPTION_RATE * disaster_multiplier
+                        truck.fuel_remaining = max(0, truck.fuel_remaining - fuel_used)
+                        truck.current_fuel_used += fuel_used
+                        
+                        # Check if fuel is critically low for next segment
+                        # Depot return is allowed ONLY if:
+                        # - fuel_remaining < fuel_needed_to_next_hub + safety_margin
+                        if truck.fuel_remaining <= 0:
+                            # Truck is out of fuel, must return to depot
+                            truck.status = "returning"
+                            
+                            truck.route = get_road_route(
+                                truck.current_latitude,
+                                truck.current_longitude,
+                                CENTRAL_HUB["latitude"],
+                                CENTRAL_HUB["longitude"]
+                            )
+                            truck.full_route = truck.route.copy()
+                            truck.current_route_index = 0
+                            
+                            world_state.ai_decisions.append(
+                                AIDecision(
+                                    truck_id=truck.id,
+                                    decision="FUEL_VIOLATION_RETURN",
+                                    explanation="Out of fuel, returning to depot due to fuel hard constraint",
+                                    timestamp=world_state.simulation_time
+                                )
+                            )
+                                            
+                        # Adjust speed based on disasters
+                        effective_speed = truck.speed
+                        if disaster_multiplier > 1.0:
+                            effective_speed = truck.speed / disaster_multiplier
                 else:
                     # ========================================
                     # ARRIVED AT HUB (SAFE DECISION POINT)
@@ -1368,58 +1181,147 @@ def simulation_loop():
                     completed_hub = hub
                     truck.current_task = None
                     
-                    # LOCAL DECISION: Try to extend route or return to depot
-                    # Prefer extending route if efficient (reduces total trips)
-                    next_hub_id = None
+                    # Update monotonic path tracking
                     if completed_hub:
-                        next_hub_id = extend_route_if_efficient(truck, completed_hub)
-                    
-                    if next_hub_id:
-                        # Extend route to nearby hub
-                        next_hub = next((h for h in world_state.hubs if h.id == next_hub_id), None)
-                        if next_hub:
-                            truck.current_task = Task(
-                                hub_id=next_hub_id,
-                                urgency_weight=get_urgency_weight(next_hub.demand_intensity),
-                                assigned_at=world_state.simulation_time
-                            )
-                            truck.status = "idle"  # Will process in next tick
+                        current_distance_from_depot = haversine(CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"], 
+                                                              completed_hub.latitude, completed_hub.longitude)
+                        # Validate monotonic progression: distance from depot should be non-decreasing
+                        if truck.last_distance_from_depot > 0 and current_distance_from_depot < truck.last_distance_from_depot:
+                            # Add validation log for non-monotonic movement
                             world_state.ai_decisions.append(
                                 AIDecision(
                                     truck_id=truck.id,
-                                    decision="EXTEND_ROUTE",
-                                    explanation=f"Extending route to {next_hub.name} (efficient extension)",
+                                    decision="MONOTONIC_VIOLATION",
+                                    explanation=f"Non-monotonic movement detected: distance decreased from {truck.last_distance_from_depot:.2f}km to {current_distance_from_depot:.2f}km from depot",
                                     timestamp=world_state.simulation_time
                                 )
                             )
-                    elif truck.future_task_queue:
-                        # More tasks in queue - continue
-                        truck.status = "idle"
-                    else:
-                        # No efficient extension, no more tasks - return to depot
-                        # FETCH ROAD ROUTE FROM OSRM (computed ONCE at destination assignment)
-                        truck.route = get_road_route(
-                            truck.current_latitude,
-                            truck.current_longitude,
-                            CENTRAL_HUB["latitude"],
-                            CENTRAL_HUB["longitude"]
-                        )
-                        truck.full_route = truck.route.copy()
-                        truck.current_route_index = 0
-                        truck.status = "returning"
                         
-                        world_state.ai_decisions.append(
-                            AIDecision(
-                                truck_id=truck.id,
-                                decision="RETURNING",
-                                explanation="Returning to depot - no efficient extensions available",
-                                timestamp=world_state.simulation_time
+                        # Update tracking variables
+                        truck.last_distance_from_depot = current_distance_from_depot
+                        truck.last_hub_visited = completed_hub.id
+                        
+                        # SANITY ASSERTION: After delivery, current task should be None
+                        # and all tasks in future queue should belong to this truck
+                        if world_state.simulation_phase in ("committed", "executing"):
+                            assert truck.current_task is None
+                            assert all(
+                                next((h for h in world_state.hubs if h.id == t.hub_id), None).owner_truck_id == truck.id
+                                for t in truck.future_task_queue
                             )
-                        )
                     
-                    truck.route.clear()
-                    truck.full_route.clear()
-                    truck.current_route_index = 0
+                    # AFTER COMMIT PHASE: Only execute pre-computed routes from fleet optimization
+                    # DISABLE: any logic that compares marginal_cost vs depot_cost
+                    # LOCAL DECISION: No route extension allowed after commit
+                    next_hub_id = None
+                    
+                    if world_state.simulation_phase in ("committed", "executing"):
+                        # AFTER DELIVERY — COMMITTED MODE
+                        dispatch_next_committed_task(truck)
+                        continue
+                    else:
+                            # Before commit phase, allow route extension
+                            if completed_hub:
+                                # EXTENSION LOGIC: Check if we can efficiently extend route after delivery
+                                # Only consider hubs in the same cluster as the truck
+                                next_hub_id = None
+                                
+                                # Check if we own any other hubs first
+                                owned_hubs = get_truck_owned_hubs(truck.id)
+                                if owned_hubs:
+                                    # Find the best owned hub to extend to
+                                    best_owned = None
+                                    best_score = float('-inf')
+                                    
+                                    for hub_id in owned_hubs:
+                                        hub = next((h for h in world_state.hubs if h.id == hub_id), None)
+                                        if hub and hub.demand_quantity > 0 and not hub.delivered:
+                                            if is_fuel_feasible_with_return(truck, hub):
+                                                score = calculate_hub_score(truck, hub)
+                                                if score > best_score:
+                                                    best_score = score
+                                                    best_owned = hub_id
+                                    
+                                    if best_owned:
+                                        next_hub_id = best_owned
+                                
+                                # If no owned hubs suitable, check for nearby UNASSIGNED hubs
+                                if not next_hub_id:
+                                    # Find nearby UNASSIGNED hubs for efficient extension
+                                    nearby_hubs = []
+                                    
+                                    for hub in world_state.hubs:
+                                        # Only consider UNASSIGNED hubs
+                                        if not is_hub_available_for_assignment(hub):
+                                            continue
+                                        
+                                        # Skip frozen hubs - they should have been assigned at commit
+                                        if hub.frozen_at_commit:
+                                            continue
+                                        
+                                        # CLUSTER ALIGNMENT: Only consider hubs in the same cluster as the truck
+                                        if truck.cluster_id and hub.cluster_id and truck.cluster_id != hub.cluster_id:
+                                            continue
+                                        
+                                        # Check fuel feasibility
+                                        if not is_fuel_feasible_with_return(truck, hub):
+                                            continue
+                                        
+                                        dist_to_hub = haversine(truck.current_latitude, truck.current_longitude,
+                                                                hub.latitude, hub.longitude)
+                                        dist_hub_to_depot = haversine(hub.latitude, hub.longitude,
+                                                                      CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"])
+                                        
+                                        # Prefer extending route if marginal cost is less than new truck cost
+                                        marginal_cost = dist_to_hub
+                                        new_truck_cost = dist_hub_to_depot
+                                        
+                                        if marginal_cost < new_truck_cost * 0.8:  # 20% margin for preference
+                                            score = calculate_hub_score(truck, hub)
+                                            nearby_hubs.append((hub.id, score, dist_to_hub))
+                                    
+                                    if nearby_hubs:
+                                        # Sort by score and select best nearby hub
+                                        nearby_hubs.sort(key=lambda x: x[1], reverse=True)
+                                        best_hub_id, _, _ = nearby_hubs[0]
+                                        
+                                        # Claim the hub before returning
+                                        if assign_hub_to_truck(best_hub_id, truck.id):
+                                            next_hub_id = best_hub_id
+                            
+                            if next_hub_id:
+                                # Extend route to nearby hub
+                                next_hub = next((h for h in world_state.hubs if h.id == next_hub_id), None)
+                                if next_hub:
+                                    truck.current_task = Task(
+                                        hub_id=next_hub_id,
+                                        urgency_weight=get_urgency_weight(next_hub.demand_intensity),
+                                        assigned_at=world_state.simulation_time
+                                    )
+                                    truck.status = "idle"  # Will process in next tick
+                                    world_state.ai_decisions.append(
+                                        AIDecision(
+                                            truck_id=truck.id,
+                                            decision="EXTEND_ROUTE",
+                                            explanation=f"Extending route to {next_hub.name} (efficient extension)",
+                                            timestamp=world_state.simulation_time
+                                        )
+                                    )
+                            elif truck.future_task_queue:
+                                # More tasks in queue - continue
+                                truck.status = "idle"
+                            else:
+                                # No efficient extension, no more tasks - truck becomes idle
+                                truck.status = "idle"
+                                
+                                world_state.ai_decisions.append(
+                                    AIDecision(
+                                        truck_id=truck.id,
+                                        decision="ROUTE_COMPLETED",
+                                        explanation="No more tasks in queue, awaiting manager instructions",
+                                        timestamp=world_state.simulation_time
+                                    )
+                                )
             
             # ========================================
             # STATE: RETURNING TO DEPOT
@@ -1439,6 +1341,8 @@ def simulation_loop():
                                 
                     # Apply disaster effects to fuel consumption and speed
                     disaster_multiplier = 1.0
+                    has_roadblock = False
+                    
                     for disaster in world_state.disasters:
                         if disaster.active:
                             # For route-based disasters, check if truck is on the affected route segment
@@ -1460,26 +1364,72 @@ def simulation_loop():
                                         is_on_affected_segment = disaster.contains_point(truck.current_latitude, truck.current_longitude)
             
                                         if is_on_affected_segment:
-                                            if disaster.disaster_type == DisasterType.TRAFFIC:
-                                                # Traffic increases fuel consumption and reduces speed
-                                                disaster_multiplier = disaster.traffic_severity
-            
+                                            if disaster.disaster_type == DisasterType.RAIN:
+                                                # RAIN (SOFT CONSTRAINT):
+                                                # - NEVER reroute
+                                                # - ONLY:
+                                                #     - increase ETA
+                                                #     - increase fuel consumption
+                                                # - Route geometry must remain unchanged
+                                                disaster_multiplier = 1.1  # ~10% slower
+
+                                                # Add notification for rain
+                                                if "Rain zone ahead" not in (truck.disaster_notifications or []):
+                                                    truck.disaster_notifications.append("Rain zone ahead — ETA may increase")
+                                            elif disaster.disaster_type == DisasterType.TRAFFIC:
+                                                # TRAFFIC (SOFT-OPTIONAL CONSTRAINT):
+                                                # - Evaluate alternate OSRM route ONLY IF:
+                                                #     alt_eta <= current_eta * 1.05
+                                                # - If no such alternate exists:
+                                                #     - stay on current route
+                                                #     - increase ETA
+                                                # - Traffic must NEVER cause cluster change or depot return
+                                                if disaster.traffic_severity > 1.05:  # Only significant traffic
+                                                    # Check if alternate route is significantly better
+                                                    # In current implementation, we continue on current route but with reduced speed
+                                                    # For real implementation, we would calculate alt_eta using OSRM
+                                                    disaster_multiplier = disaster.traffic_severity
+                                                else:
+                                                    # Traffic not severe enough to justify rerouting
+                                                    disaster_multiplier = max(disaster_multiplier, disaster.traffic_severity)
+
+                                                # Validate that traffic does not cause cluster change
+                                                # Traffic must NEVER cause cluster change
+                                                if truck.current_task:
+                                                    next_hub = next((h for h in world_state.hubs if h.id == truck.current_task.hub_id), None)
+                                                    if next_hub and truck.cluster_id and next_hub.cluster_id and truck.cluster_id != next_hub.cluster_id:
+                                                        # Add validation log for cluster violation caused by traffic
+                                                        world_state.ai_decisions.append(
+                                                            AIDecision(
+                                                                truck_id=truck.id,
+                                                                decision="TRAFFIC_CLUSTER_VIOLATION",
+                                                                explanation=f"Traffic causing movement to different cluster (truck: {truck.cluster_id}, next_hub: {next_hub.cluster_id})",
+                                                                timestamp=world_state.simulation_time
+                                                            )
+                                                        )
+
                                                 # Add notification for traffic
                                                 if "Traffic ahead" not in (truck.disaster_notifications or []):
                                                     truck.disaster_notifications.append("Traffic ahead — continuing on current route")
                                             elif disaster.disaster_type == DisasterType.ROAD_BLOCK:
-                                                # Road blocks should have been handled at decision points
-                                                # If truck is still moving through a road block, it's an error
-                                                print(f"[ERROR] Truck {truck.id} moving through road block at ({truck.current_latitude}, {truck.current_longitude})")
-            
+                                                # ROAD BLOCK (HARD CONSTRAINT):
+                                                # - If roadblock intersects current route:
+                                                #     - attempt reroute to SAME target hub via OSRM
+                                                #     - IF reroute fails:
+                                                #          stop truck
+                                                #          set status = BLOCKED_WAITING_OVERRIDE
+                                                #          preserve current_task and route index
+                                                # - NEVER auto-return to depot on roadblock
+                                                has_roadblock = True
+
                                                 # Add notification for road block
                                                 if "Road blocked" not in (truck.disaster_notifications or []):
                                                     truck.disaster_notifications.append("Road blocked — waiting for instructions")
-            
-                                                # Set truck to blocked status
+
+                                                # Set truck to blocked status but preserve route and task
                                                 truck.blocked_status = "BLOCKED_WAITING_OVERRIDE"
-                                                truck.status = "idle"
-            
+                                                truck.status = "blocked"
+
                                                 # Add AI decision to notify manager
                                                 world_state.ai_decisions.append(
                                                     AIDecision(
@@ -1489,26 +1439,73 @@ def simulation_loop():
                                                         timestamp=world_state.simulation_time
                                                     )
                                                 )
-            
-                                                # Clear the route to stop movement
-                                                truck.route.clear()
+
+                                                # Break the loop since we need to stop
+                                                break
                             else:
                                 # For non-route disasters (like rain), check if point is within radius
                                 if disaster.contains_point(truck.current_latitude, truck.current_longitude):
                                     if disaster.disaster_type == DisasterType.RAIN:
-                                        # Rain increases fuel consumption slightly
-                                        disaster_multiplier = 1.1
-            
+                                        # RAIN (SOFT CONSTRAINT):
+                                        # - NEVER reroute
+                                        # - ONLY:
+                                        #     - increase ETA
+                                        #     - increase fuel consumption
+                                        # - Route geometry must remain unchanged
+                                        disaster_multiplier = 1.1  # ~10% slower
+
+                                        # Validate that rain does not cause cluster change
+                                        # Rain must NEVER cause cluster change
+                                        if truck.current_task:
+                                            next_hub = next((h for h in world_state.hubs if h.id == truck.current_task.hub_id), None)
+                                            if next_hub and truck.cluster_id and next_hub.cluster_id and truck.cluster_id != next_hub.cluster_id:
+                                                # Add validation log for cluster violation caused by rain
+                                                world_state.ai_decisions.append(
+                                                    AIDecision(
+                                                        truck_id=truck.id,
+                                                        decision="RAIN_CLUSTER_VIOLATION",
+                                                        explanation=f"Rain causing movement to different cluster (truck: {truck.cluster_id}, next_hub: {next_hub.cluster_id})",
+                                                        timestamp=world_state.simulation_time
+                                                    )
+                                                )
+
                                         # Add notification for rain
                                         if "Rain zone ahead" not in (truck.disaster_notifications or []):
                                             truck.disaster_notifications.append("Rain zone ahead — ETA may increase")
-                                            
-                    truck.fuel_remaining = max(0, truck.fuel_remaining - segment_dist * FUEL_CONSUMPTION_RATE * disaster_multiplier)
+                    
+                    # Only apply fuel consumption if not blocked by roadblock
+                    if not has_roadblock:
+                        fuel_used = segment_dist * FUEL_CONSUMPTION_RATE * disaster_multiplier
+                        truck.fuel_remaining = max(0, truck.fuel_remaining - fuel_used)
+                        
+                        # Check if fuel is critically low for next segment
+                        # Depot return is allowed ONLY if:
+                        # - fuel_remaining < fuel_needed_to_next_hub + safety_margin
+                        if truck.fuel_remaining <= 0:
+                            # Truck is out of fuel, must return to depot
+                            truck.status = "returning"
+                            
+                            truck.route = get_road_route(
+                                truck.current_latitude,
+                                truck.current_longitude,
+                                CENTRAL_HUB["latitude"],
+                                CENTRAL_HUB["longitude"]
+                            )
+                            truck.full_route = truck.route.copy()
+                            truck.current_route_index = 0
+                            
+                            world_state.ai_decisions.append(
+                                AIDecision(
+                                    truck_id=truck.id,
+                                    decision="FUEL_VIOLATION_RETURN",
+                                    explanation="Out of fuel, returning to depot due to fuel hard constraint",
+                                    timestamp=world_state.simulation_time
+                                )
+                            )
                 else:
                     # ARRIVED AT DEPOT (SAFE DECISION POINT)
                     truck.current_latitude = CENTRAL_HUB["latitude"]
                     truck.current_longitude = CENTRAL_HUB["longitude"]
-                    truck.status = "idle"
                     
                     # Refuel and reset
                     truck.fuel_remaining = truck.fuel_capacity
@@ -1517,14 +1514,60 @@ def simulation_loop():
                     truck.route.clear()
                     truck.full_route.clear()
                     truck.current_route_index = 0
+                    
+                    # Preserve cluster assignment - only change status after processing
+                    truck.status = "idle"
+                    
+                    # Log truck arrival at depot
+                    world_state.ai_decisions.append(
+                        AIDecision(
+                            truck_id=truck.id,
+                            decision="ARRIVED_AT_DEPOT",
+                            explanation="Truck arrived at depot and is now idle, awaiting instructions",
+                            timestamp=world_state.simulation_time
+                        )
+                    )
 
 # =========================
 # API
 # =========================
 
 
+@app.post("/upload/hubs")
+async def upload_hubs(file: UploadFile = File(...)):
+    text = (await file.read()).decode()
+    reader = csv.DictReader(io.StringIO(text))
+
+    # Clear existing non-central hubs
+    world_state.hubs = [h for h in world_state.hubs if h.id == CENTRAL_HUB["id"]]
+
+    for row in reader:
+        # Compute haversine distance from Trichy (central hub)
+        distance_from_trichy = haversine(CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"], float(row["latitude"]), float(row["longitude"]))
+        
+        # If distance > 220 km, skip this hub
+        if distance_from_trichy > 220:
+            continue  # Skip this hub if outside radius
+        
+        hub = Hub(
+            id=row["id"],
+            name=row["name"],
+            latitude=float(row["latitude"]),
+            longitude=float(row["longitude"]),
+            demand_quantity=int(row["demand_quantity"]),
+            availability=int(row.get("availability", 20)),
+            delivered=False,
+            demand_intensity=row.get("demand_intensity", "Medium"),
+            deadline_hours=float(row.get("deadline_hours", 7.5)),  # Default to 7.5 if not provided
+            distance_from_trichy_km=distance_from_trichy
+        )
+        world_state.hubs.append(hub)
+    
+    return {"count": len([h for h in world_state.hubs if h.id != CENTRAL_HUB["id"]])}
+
+
 @app.post("/upload/trucks")
-async def upload_trucks(file: UploadFile = File(...)):
+async def upload_trucks(file: UploadFile = File(...)): 
     text = (await file.read()).decode()
     reader = csv.DictReader(io.StringIO(text))
 
@@ -1548,82 +1591,63 @@ async def upload_trucks(file: UploadFile = File(...)):
     ]
     return {"count": len(world_state.trucks)}
 
-def initialize_task_queues_from_route_plans():
-    """Convert legacy route_plan to new task queue system"""
-    for truck in world_state.trucks:
-        if not truck.active:
-            continue
-        
-        # Clear task queues
-        truck.current_task = None
-        truck.future_task_queue = []
-        
-        # Convert route_plan to task queue
-        for hub_id in truck.route_plan:
-            hub = next((h for h in world_state.hubs if h.id == hub_id), None)
-            if hub:
-                task = Task(
-                    hub_id=hub_id,
-                    urgency_weight=get_urgency_weight(hub.demand_intensity),
-                    assigned_at=world_state.simulation_time
-                )
-                truck.future_task_queue.append(task)
-        
-        # If truck has tasks, make first one the current task (if idle)
-        if truck.future_task_queue and truck.status == "idle":
-            truck.current_task = truck.future_task_queue.pop(0)
 
 @app.post("/simulation/start")
 def start_sim():
     """
     ====================================================
-    COMMIT PHASE - STRICT TWO-STAGE CONTRACT
+    COMMIT PHASE - FLEXIBLE TWO-STAGE CONTRACT
     ====================================================
     
-    This endpoint initiates the MANDATORY commit phase:
+    This endpoint initiates the commit phase:
     1. Freezes all hubs
-    2. Assigns ALL hubs to trucks (must succeed for every hub)
-    3. Validates that no hub remains unassigned
-    4. Blocks simulation if any hub is unassigned
-    5. Starts execution phase only after successful commit
+    2. Assigns feasible hubs to trucks using fleet optimization
+    3. Allows unassigned hubs when constraints prevent service
+    4. Starts execution phase regardless
     """
     # Freeze hubs - no new hubs can be added after this
     world_state.hubs_frozen = True
     world_state.simulation_phase = "committing"
     
     # ===========================================
-    # COMMIT PHASE: Assign ALL hubs (MANDATORY)
+    # COMMIT PHASE: Assign feasible hubs to trucks
     # ===========================================
     commit_success = assign_hubs_to_trucks()
     
     if not commit_success:
-        # COMMIT FAILED: Some hubs are unassigned
-        # Revert to pre_start state and block simulation
-        world_state.hubs_frozen = False
-        world_state.simulation_phase = "pre_start"
-        
-        # Clear any partial assignments
-        for hub in world_state.hubs:
-            if hub.id != CENTRAL_HUB["id"]:
-                hub.ownership_state = HubOwnershipState.UNASSIGNED
-                hub.owner_truck_id = None
-                hub.frozen_at_commit = False
-        
-        for truck in world_state.trucks:
-            truck.route_plan.clear()
-            truck.future_task_queue = []
-            truck.current_task = None
-        
-        raise HTTPException(
-            status_code=400, 
-            detail="COMMIT FAILED: Not all hubs could be assigned. Check truck capacity and availability."
-        )
+        # COMMIT FAILED: Check if it's due to no trucks
+        active_trucks_count = len([t for t in world_state.trucks if t.active])
+        if active_trucks_count == 0:
+            # Revert to pre_start state and block simulation
+            world_state.hubs_frozen = False
+            world_state.simulation_phase = "pre_start"
+            
+            # Clear any partial assignments
+            for hub in world_state.hubs:
+                if hub.id != CENTRAL_HUB["id"]:
+                    hub.ownership_state = HubOwnershipState.UNASSIGNED
+                    hub.owner_truck_id = None
+                    hub.frozen_at_commit = False
+            
+            for truck in world_state.trucks:
+                truck.route_plan.clear()
+                truck.future_task_queue = []
+                truck.current_task = None
+            
+            raise HTTPException(
+                status_code=400, 
+                detail="COMMIT FAILED: No active trucks available. Please upload trucks.csv before starting simulation."
+            )
+        else:
+            # COMMIT SUCCEEDED: Even if some hubs are unassigned due to constraints
+            # This is allowed according to the optimization goal
+            # Unassigned hubs are marked with a clear reason
+            pass  # Continue with execution since some routes were created
     
-    # COMMIT SUCCESS: All hubs are assigned and frozen
+    # COMMIT SUCCESS: All feasible hubs are assigned and frozen
     world_state.simulation_phase = "committed"
     
-    # Convert route plans to task queues
-    initialize_task_queues_from_route_plans()
+
 
     world_state.simulation_running = True
     world_state.simulation_phase = "executing"
@@ -1632,9 +1656,14 @@ def start_sim():
     simulation_thread = Thread(target=simulation_loop, daemon=True)
     simulation_thread.start()
     
+    # Count assigned and unassigned hubs
+    assigned_count = len([h for h in world_state.hubs if h.ownership_state == HubOwnershipState.ASSIGNED])
+    unassigned_count = len([h for h in world_state.hubs if h.ownership_state == HubOwnershipState.UNASSIGNED and h.id != CENTRAL_HUB["id"]])
+    
     return {
-        "message": "COMMIT SUCCESS: All hubs assigned and frozen. Execution phase started.",
-        "hubs_committed": len(world_state.initial_hubs_with_demand),
+        "message": f"COMMIT SUCCESS: {assigned_count} hubs assigned, {unassigned_count} hubs deferred due to constraints. Execution phase started.",
+        "hubs_committed": assigned_count,
+        "hubs_deferred": unassigned_count,
         "trucks_active": len([t for t in world_state.trucks if t.active])
     }
 
@@ -1680,12 +1709,10 @@ class HubCreateRequest(BaseModel):
     latitude: float
     longitude: float
     demand_quantity: int
-    demand_priority: str
     availability: int = 20
 
 class HubUpdateRequest(BaseModel):
     demand_quantity: int
-    demand_priority: str
 
 @app.post("/hubs/manual")
 async def create_hub_manual(hub_data: HubCreateRequest):
@@ -1716,11 +1743,10 @@ async def create_hub_manual(hub_data: HubCreateRequest):
         latitude=hub_data.latitude,
         longitude=hub_data.longitude,
         demand_quantity=hub_data.demand_quantity,
-        demand_priority=hub_data.demand_priority,
         availability=hub_data.availability if hasattr(hub_data, 'availability') else 20,
-        priority_cost=0.0,
         delivered=False,
         demand_intensity="Medium",  # Default intensity
+        deadline_hours=7.5,  # Default deadline
         distance_from_trichy_km=distance_from_trichy  # Store distance from Trichy
     )
     
@@ -1746,9 +1772,9 @@ async def create_random_hubs():  # Name kept for compatibility but creates fixed
                         "latitude": 10.7867,
                         "longitude": 79.1378,
                         "demand_quantity": 1,
-                        "demand_priority": "High",
                         "availability": 20,
-                        "priority_cost": 0.0
+                        "demand_intensity": "High",
+                        "deadline_hours": 7
                     },
                     {
                         "id": "H2",
@@ -1756,9 +1782,9 @@ async def create_random_hubs():  # Name kept for compatibility but creates fixed
                         "latitude": 10.9601,
                         "longitude": 78.0766,
                         "demand_quantity": 1,
-                        "demand_priority": "Medium",
                         "availability": 20,
-                        "priority_cost": 0.0
+                        "demand_intensity": "Medium",
+                        "deadline_hours": 7.5
                     },
                     {
                         "id": "H3",
@@ -1766,9 +1792,9 @@ async def create_random_hubs():  # Name kept for compatibility but creates fixed
                         "latitude": 10.3673,
                         "longitude": 77.9803,
                         "demand_quantity": 1,
-                        "demand_priority": "Medium",
                         "availability": 20,
-                        "priority_cost": 0.0
+                        "demand_intensity": "Medium",
+                        "deadline_hours": 7
                     },
                     {
                         "id": "H4",
@@ -1776,9 +1802,9 @@ async def create_random_hubs():  # Name kept for compatibility but creates fixed
                         "latitude": 11.2342,
                         "longitude": 78.8803,
                         "demand_quantity": 1,
-                        "demand_priority": "Low",
                         "availability": 20,
-                        "priority_cost": 0.0
+                        "demand_intensity": "Low",
+                        "deadline_hours": 8
                     },
                     {
                         "id": "H5",
@@ -1786,9 +1812,9 @@ async def create_random_hubs():  # Name kept for compatibility but creates fixed
                         "latitude": 11.1401,
                         "longitude": 79.0787,
                         "demand_quantity": 1,
-                        "demand_priority": "Low",
                         "availability": 20,
-                        "priority_cost": 0.0
+                        "demand_intensity": "Low",
+                        "deadline_hours": 8
                     },
                     {
                         "id": "H6",
@@ -1796,9 +1822,9 @@ async def create_random_hubs():  # Name kept for compatibility but creates fixed
                         "latitude": 10.3797,
                         "longitude": 78.8208,
                         "demand_quantity": 1,
-                        "demand_priority": "Medium",
                         "availability": 20,
-                        "priority_cost": 0.0
+                        "demand_intensity": "Medium",
+                        "deadline_hours": 8
                     },
                     {
                         "id": "H7",
@@ -1806,9 +1832,9 @@ async def create_random_hubs():  # Name kept for compatibility but creates fixed
                         "latitude": 9.8470,
                         "longitude": 78.4809,
                         "demand_quantity": 1,
-                        "demand_priority": "Low",
                         "availability": 20,
-                        "priority_cost": 0.0
+                        "demand_intensity": "Low",
+                        "deadline_hours": 8
                     },
                     {
                         "id": "H8",
@@ -1816,9 +1842,9 @@ async def create_random_hubs():  # Name kept for compatibility but creates fixed
                         "latitude": 9.5851,
                         "longitude": 77.9579,
                         "demand_quantity": 1,
-                        "demand_priority": "Medium",
                         "availability": 20,
-                        "priority_cost": 0.0
+                        "demand_intensity": "Medium",
+                        "deadline_hours": 7
                     },
                     {
                         "id": "H9",
@@ -1826,9 +1852,9 @@ async def create_random_hubs():  # Name kept for compatibility but creates fixed
                         "latitude": 11.6643,
                         "longitude": 78.1460,
                         "demand_quantity": 1,
-                        "demand_priority": "High",
                         "availability": 20,
-                        "priority_cost": 0.0
+                        "demand_intensity": "High",
+                        "deadline_hours": 7
                     },
                     {
                         "id": "H10",
@@ -1836,9 +1862,9 @@ async def create_random_hubs():  # Name kept for compatibility but creates fixed
                         "latitude": 11.2194,
                         "longitude": 78.1677,
                         "demand_quantity": 1,
-                        "demand_priority": "Medium",
                         "availability": 20,
-                        "priority_cost": 0.0
+                        "demand_intensity": "Medium",
+                        "deadline_hours": 6.2
                     }
                 ]
 
@@ -1865,7 +1891,7 @@ async def create_random_hubs():  # Name kept for compatibility but creates fixed
 
 @app.put("/hubs/{hub_id}/demand")
 def update_hub_demand(hub_id: str, update_data: HubUpdateRequest):
-    """Update hub demand quantity and priority"""
+    """Update hub demand quantity"""
     if hub_id == CENTRAL_HUB["id"]:
         raise HTTPException(status_code=400, detail="Cannot modify central hub")
     
@@ -1874,7 +1900,6 @@ def update_hub_demand(hub_id: str, update_data: HubUpdateRequest):
         raise HTTPException(status_code=404, detail="Hub not found")
     
     hub.demand_quantity = update_data.demand_quantity
-    hub.demand_priority = update_data.demand_priority
     
     # If simulation is running, trucks will pick up changes in next assignment cycle
     # Remove hub from truck assignments if it's no longer needed
@@ -1944,7 +1969,7 @@ class DisasterCreateRequest(BaseModel):
     longitude: float
     radius_km: float = 5.0
     # For route-based disasters
-    affected_route_id: Optional[str] = None
+    # NOTE: affected_route_id has been removed as roadblocks affect route geometry, not truck assignment
     affected_segment_start_idx: Optional[int] = None
     affected_segment_end_idx: Optional[int] = None
 
@@ -2060,18 +2085,15 @@ def create_disaster(request: DisasterCreateRequest):
     # For traffic and roadblock disasters, implement snapping logic
     snapped_lat = request.latitude
     snapped_lon = request.longitude
-    affected_route_id = None
     affected_segment_start_idx = None
     affected_segment_end_idx = None
     snapped_coordinates = None
     
     if request.disaster_type in ["traffic", "road_block"]:
         # If route segment information is provided, use it directly
-        if (request.affected_route_id is not None and 
-            request.affected_segment_start_idx is not None and 
+        if (request.affected_segment_start_idx is not None and 
             request.affected_segment_end_idx is not None):
             # Use provided route segment information
-            affected_route_id = request.affected_route_id
             affected_segment_start_idx = request.affected_segment_start_idx
             affected_segment_end_idx = request.affected_segment_end_idx
             snapped_coordinates = {"latitude": snapped_lat, "longitude": snapped_lon}
@@ -2079,7 +2101,6 @@ def create_disaster(request: DisasterCreateRequest):
             # Find nearest active route segment
             nearest_point = None
             min_distance = float('inf')
-            nearest_route_id = None
             nearest_segment_start_idx = None
             nearest_segment_end_idx = None
             
@@ -2105,7 +2126,6 @@ def create_disaster(request: DisasterCreateRequest):
                     if distance < min_distance:
                         min_distance = distance
                         nearest_point = (closest_lat, closest_lon)
-                        nearest_route_id = truck.id
                         nearest_segment_start_idx = i
                         nearest_segment_end_idx = i + 1
             
@@ -2114,7 +2134,6 @@ def create_disaster(request: DisasterCreateRequest):
             
             if nearest_point and min_distance <= threshold:
                 snapped_lat, snapped_lon = nearest_point
-                affected_route_id = nearest_route_id
                 affected_segment_start_idx = nearest_segment_start_idx
                 affected_segment_end_idx = nearest_segment_end_idx
                 snapped_coordinates = {"latitude": snapped_lat, "longitude": snapped_lon}
@@ -2129,7 +2148,6 @@ def create_disaster(request: DisasterCreateRequest):
         longitude=request.longitude,
         radius_km=request.radius_km,
         created_at=world_state.simulation_time,
-        affected_route_id=affected_route_id,
         affected_segment_start_idx=affected_segment_start_idx,
         affected_segment_end_idx=affected_segment_end_idx,
         snapped_coordinates=snapped_coordinates
@@ -2238,6 +2256,577 @@ def override_truck_block(truck_id: str, action: str):
     else:
         return {"error": "Invalid action. Use 'clear_road' or 'return_to_depot'"}
         
+# FLEET-LEVEL DIRECTIONAL LOGISTICS OPTIMIZATION ALGORITHM
+# Implementation of the sector-based routing algorithm to eliminate zig-zag patterns
+# and optimize fleet-wide fuel consumption
+
+def compute_polar_coordinates():
+    """
+    Canonical transformation: Convert hubs to polar space.
+    
+    For each hub i:
+    r_i  = distance(depot → hub)   [km]
+    θ_i  = bearing angle (0–360°)
+    t_i  = r_i / speed             [hours]
+    """
+    polar_coords = {}
+    for hub in world_state.hubs:
+        if hub.id == CENTRAL_HUB["id"]:
+            continue
+        
+        bearing = compute_bearing_from_trichy(hub)
+        distance = haversine(CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"], 
+                            hub.latitude, hub.longitude)
+        # Using the fastest truck's speed as a conservative estimate
+        fastest_truck = max(world_state.trucks, key=lambda t: t.speed) if world_state.trucks else None
+        speed = fastest_truck.speed if fastest_truck else 50.0
+        time_hours = distance / speed
+        
+        polar_coords[hub.id] = {
+            'hub': hub,
+            'bearing': bearing,
+            'distance': distance,
+            'time_hours': time_hours
+        }
+    return polar_coords
+
+
+def filter_hard_feasibility(polar_coords):
+    """
+    HARD FEASIBILITY FILTER: Discard hubs that are physically impossible.
+    
+    Remove hub i if any of these hold:
+    - t_i > 7.5
+    - t_i > deadline_i
+    - No truck has fuel for (depot → hub → depot)
+    """
+    feasible_coords = {}
+    
+    for hub_id, coords in polar_coords.items():
+        hub = coords['hub']
+        
+        # Check time constraint: time to hub > 7.5
+        if coords['time_hours'] > MAX_DRIVING_TIME_HRS:
+            print(f"[DROPPED] {hub.name} deadline={hub.deadline_hours}, time={coords['time_hours']:.2f}")
+            continue
+        
+        # Check fuel constraint: depot -> hub -> depot
+        # Calculate fuel needed for round trip: depot -> hub -> depot
+        depot_to_hub_dist = coords['distance']
+        hub_to_depot_dist = coords['distance']  # Same distance back to depot
+        total_distance = depot_to_hub_dist + hub_to_depot_dist
+        fuel_needed = total_distance * FUEL_CONSUMPTION_RATE
+        
+        can_any_truck_reach = False
+        for truck in world_state.trucks:
+            if truck.fuel_remaining >= fuel_needed:
+                can_any_truck_reach = True
+                break
+        
+        if not can_any_truck_reach:
+            print(f"[DROPPED] {hub.name} deadline={hub.deadline_hours}, time={coords['time_hours']:.2f}")
+            continue
+        
+        feasible_coords[hub_id] = coords
+    
+    return feasible_coords
+
+
+def create_directional_sectors(polar_coords, sector_width=30):
+    """
+    Directional sectorization: Divide 360° around depot into fixed angular sectors.
+    Recommended: 30° sectors → 12 sectors
+    """
+    sectors = {}
+    num_sectors = int(360 / sector_width)
+    
+    for hub_id, coords in polar_coords.items():
+        # Calculate which sector this hub belongs to
+        sector_idx = int(coords['bearing'] / sector_width) % num_sectors
+        if sector_idx not in sectors:
+            sectors[sector_idx] = []
+        sectors[sector_idx].append(coords)
+    
+    return sectors
+
+
+def order_sector_hubs(sector_hubs):
+    """
+    Sector-local hub ordering: Inside each sector independently sort by:
+    1. deadline (earliest first)
+    2. distance r_i (nearest first) - prevents zig-zag by building routes radially outward
+    """
+    # Sort by deadline first (earliest first), then by distance (nearest first for same deadline)
+    # This ensures radial progression and prevents zig-zag routing
+    ordered_hubs = sorted(sector_hubs, key=lambda x: (x['hub'].deadline_hours, x['distance']))
+    return ordered_hubs
+
+
+def construct_sector_routes(ordered_hubs, truck_speed):
+    """
+    Sector route construction: Pack hubs into routes respecting 7.5h time limit and fuel constraints separately.
+    Time constraint: depot -> last hub in route <= 7.5h (return trip not counted)
+    Fuel constraint: depot -> route -> depot must fit in truck fuel capacity
+    Route construction is greedy, monotonic, and radial to prevent zig-zag:
+    - Start at depot
+    - Append nearest feasible hub
+    - Distance from depot must be non-decreasing OR lateral-only
+    - NEVER go inward after going outward
+    """
+    routes = []
+    current_route = []
+    current_time = 0
+    current_position = {'latitude': CENTRAL_HUB["latitude"], 'longitude': CENTRAL_HUB["longitude"]}
+    
+    # Track the maximum distance from depot reached so far to enforce radial constraint
+    max_distance_so_far = 0
+    
+    for hub_data in ordered_hubs:
+        hub = hub_data['hub']
+        
+        # Calculate distance from depot to this hub
+        distance_from_depot = hub_data['distance']
+        
+        # Radial constraint: never go inward after going outward
+        # Enforce: next_hub.distance >= last_hub.distance − epsilon
+        epsilon = 0.05  # Small tolerance to account for floating point precision
+        
+        # Calculate angular difference to prevent unnecessary route splitting
+        current_bearing = compute_bearing_from_point(current_position["latitude"], current_position["longitude"])
+        hub_bearing = compute_bearing_from_point(hub.latitude, hub.longitude)
+        angular_diff = abs(current_bearing - hub_bearing)
+        
+        # Use a threshold of 30 degrees (in radians, approximately 0.524)
+        theta_threshold = 30.0  # degrees
+        
+        if distance_from_depot < max_distance_so_far - epsilon and angular_diff > theta_threshold:
+            # This hub violates the radial constraint, so we need to start a new route
+            # Close current route if it has hubs
+            if current_route:
+                routes.append({
+                    'hubs': [hd['hub'] for hd in current_route],
+                    'hub_data': current_route,
+                    'time': current_time,
+                    'distance': sum(haversine(CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"], hd['hub'].latitude, hd['hub'].longitude) for hd in current_route)  # Use actual total distance for envelope cost
+                })
+            
+            # Start new route with this hub
+            current_route = [hub_data]
+            
+            # Calculate time to this hub from depot
+            arrival_time = hub_data['time_hours']
+            current_time = arrival_time
+            current_position = {'latitude': hub.latitude, 'longitude': hub.longitude}
+            max_distance_so_far = distance_from_depot
+            
+            continue
+        
+        # Calculate time to this hub from current position
+        if len(current_route) == 0:
+            # First hub in route: depot -> hub
+            delta_time = hub_data['time_hours']
+        else:
+            # Time from last hub in route to this hub
+            dist_to_hub = haversine(current_position['latitude'], current_position['longitude'],
+                                  hub.latitude, hub.longitude)
+            delta_time = dist_to_hub / truck_speed
+        
+        # Calculate arrival time at this hub
+        arrival_time = current_time + delta_time
+        
+        # Check time constraint: total time to this hub from depot <= 7.5h (deadline is soft constraint)
+        time_constraint_ok = arrival_time <= MAX_DRIVING_TIME_HRS
+        
+        # Check if we can add this hub to current route
+        if time_constraint_ok:
+            # HARD deadline constraint - check if arrival time exceeds hub deadline
+            if arrival_time > hub.deadline_hours:
+                # Close current route if it has hubs
+                if current_route:
+                    routes.append({
+                        'hubs': [hd['hub'] for hd in current_route],
+                        'hub_data': current_route,
+                        'time': current_time,
+                        'distance': sum(haversine(CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"], hd['hub'].latitude, hd['hub'].longitude) for hd in current_route)  # Use actual total distance for envelope cost
+                    })
+                
+                # Start new route with this hub
+                current_route = [hub_data]
+                current_time = hub_data['time_hours']  # Time from depot to this hub
+                current_position = {'latitude': hub.latitude, 'longitude': hub.longitude}
+                max_distance_so_far = distance_from_depot
+                continue
+            
+            # Temporarily add hub to current route to check fuel feasibility
+            temp_route = current_route + [hub_data]
+            
+            # Check fuel feasibility for the entire route (depot -> all hubs -> depot)
+            # Calculate total fuel needed for round trip using actual route distances
+            # fuel_needed = sum(inter-hub distances) + distance(last_hub → depot)
+            fuel_check_ok = True
+            if world_state.trucks:  # Only check if trucks exist
+                # Calculate fuel needed for depot -> route -> depot using actual path distances
+                # Fuel = sum(distances between consecutive hubs) + distance(last_hub -> depot)
+                total_fuel_needed = 0
+                
+                # Calculate fuel for depot to first hub
+                if len(temp_route) > 0:
+                    first_hub_dist = temp_route[0]['distance']  # Distance from depot to first hub
+                    total_fuel_needed += first_hub_dist
+                    
+                    # Add distances between consecutive hubs
+                    for i in range(1, len(temp_route)):
+                        prev_hub = temp_route[i-1]['hub']
+                        curr_hub = temp_route[i]['hub']
+                        inter_hub_dist = haversine(prev_hub.latitude, prev_hub.longitude,
+                                                   curr_hub.latitude, curr_hub.longitude)
+                        total_fuel_needed += inter_hub_dist
+                    
+                    # Add distance from last hub back to depot
+                    last_hub = temp_route[-1]['hub']
+                    depot_return_dist = haversine(last_hub.latitude, last_hub.longitude,
+                                                  CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"])
+                    total_fuel_needed += depot_return_dist
+                    
+                    # Convert to fuel requirement
+                    total_fuel_needed *= FUEL_CONSUMPTION_RATE
+                    
+                # Check if any truck has enough fuel capacity for this round trip
+                fuel_check_ok = any(truck.fuel_capacity >= total_fuel_needed for truck in world_state.trucks)
+            
+            if fuel_check_ok:
+                # Add hub to current route
+                current_route.append(hub_data)
+                current_time = arrival_time  # Update to the arrival time at this hub
+                current_position = {'latitude': hub.latitude, 'longitude': hub.longitude}
+                
+                # Update the maximum distance reached if this hub is farther
+                if distance_from_depot > max_distance_so_far:
+                    max_distance_so_far = distance_from_depot
+            else:
+                # Close current route if it has hubs
+                if current_route:
+                    routes.append({
+                        'hubs': [hd['hub'] for hd in current_route],
+                        'hub_data': current_route,
+                        'time': current_time,
+                        'distance': sum(haversine(CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"], hd['hub'].latitude, hd['hub'].longitude) for hd in current_route)  # Use actual total distance for envelope cost
+                    })
+                
+                # Start new route with this hub
+                current_route = [hub_data]
+                current_time = hub_data['time_hours']  # Time from depot to this hub
+                current_position = {'latitude': hub.latitude, 'longitude': hub.longitude}
+                max_distance_so_far = distance_from_depot
+        else:
+            # Close current route if it has hubs
+            if current_route:
+                routes.append({
+                    'hubs': [hd['hub'] for hd in current_route],
+                    'hub_data': current_route,
+                    'time': current_time,
+                    'distance': sum(haversine(CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"], hd['hub'].latitude, hd['hub'].longitude) for hd in current_route)  # Use actual total distance for envelope cost
+                })
+            
+            # Start new route with this hub
+            current_route = [hub_data]
+            current_time = hub_data['time_hours']  # Time from depot to this hub
+            current_position = {'latitude': hub.latitude, 'longitude': hub.longitude}
+            max_distance_so_far = hub_data['distance']  # Distance from depot to this hub
+    
+    # Add the final route if it has hubs
+    if current_route:
+        routes.append({
+            'hubs': [hd['hub'] for hd in current_route],
+            'hub_data': current_route,
+            'time': current_time,
+            'distance': sum(haversine(CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"], hd['hub'].latitude, hd['hub'].longitude) for hd in current_route)  # Use actual total distance for envelope cost
+        })
+    
+    return routes
+
+
+def compute_route_envelope_cost(route_hub_data_list):
+    """
+    Route envelope cost: fuel_cost(R) = actual route distance + return distance
+    This computes the fuel needed for depot -> route -> depot using actual distances
+    """
+    if not route_hub_data_list:
+        return 0.0
+    
+    # Calculate total distance for depot -> route -> depot
+    total_distance = 0.0
+    
+    if route_hub_data_list:
+        # Add distance from depot to first hub
+        total_distance += route_hub_data_list[0]['distance']
+        
+        # Add distances between consecutive hubs in the route
+        for i in range(1, len(route_hub_data_list)):
+            prev_hub = route_hub_data_list[i-1]['hub']
+            curr_hub = route_hub_data_list[i]['hub']
+            inter_hub_dist = haversine(prev_hub.latitude, prev_hub.longitude,
+                                       curr_hub.latitude, curr_hub.longitude)
+            total_distance += inter_hub_dist
+        
+        # Add distance from last hub back to depot
+        last_hub = route_hub_data_list[-1]['hub']
+        depot_return_dist = haversine(last_hub.latitude, last_hub.longitude,
+                                      CENTRAL_HUB["latitude"], CENTRAL_HUB["longitude"])
+        total_distance += depot_return_dist
+    
+    return total_distance * FUEL_CONSUMPTION_RATE  # Actual fuel requirement
+
+
+def compute_sector_summary(sectors_routes):
+    """
+    Sector demand summary: compute metrics for each sector.
+    """
+    sector_summaries = {}
+    
+    for sector_idx, routes in sectors_routes.items():
+        total_routes = len(routes)
+        total_hubs = sum(len(route['hubs']) for route in routes)
+        total_demand = sum(sum(h.demand_quantity for h in route['hubs']) for route in routes)
+        total_fuel = sum(compute_route_envelope_cost(route['hub_data']) for route in routes)
+        
+        sector_summaries[sector_idx] = {
+            'routes': total_routes,
+            'hubs_served': total_hubs,
+            'total_demand': total_demand,
+            'total_fuel': total_fuel
+        }
+    
+    return sector_summaries
+
+
+def select_global_routes(sectors_routes, available_trucks):
+    """
+    Global truck & fuel optimization: Select routes by priority:
+    1) earliest deadline coverage
+    2) more hubs served
+    3) lower total distance
+    """
+    # Flatten all routes from all sectors
+    all_routes = []
+    for sector_idx, routes in sectors_routes.items():
+        for route in routes:
+            envelope_cost = compute_route_envelope_cost(route['hub_data'])
+            num_hubs = len(route['hubs'])
+            total_demand = sum(h.demand_quantity for h in route['hubs'])
+            
+            # Find the earliest deadline in this route
+            earliest_deadline = min(h.deadline_hours for h in route['hubs']) if route['hubs'] else float('inf')
+            
+            all_routes.append({
+                'sector_idx': sector_idx,
+                'route': route,
+                'envelope_cost': envelope_cost,
+                'num_hubs': num_hubs,
+                'total_demand': total_demand,
+                'earliest_deadline': earliest_deadline,
+                # Score prioritizing: 1) earliest deadline, 2) more hubs, 3) lower effective cost (envelope + activation penalty)
+                'score': (
+                    -earliest_deadline,
+                    num_hubs,
+                    -(envelope_cost + TRUCK_ACTIVATION_PENALTY_LITERS)  # Effective cost includes activation penalty
+                )  # Negative deadline for ascending order, negative fuel for descending efficiency
+            })
+    
+    # Sort routes by score (highest first) - Python sorts tuples lexicographically
+    all_routes.sort(key=lambda r: r['score'], reverse=True)
+    
+    # Greedily select routes until we run out of trucks
+    selected_routes = []
+    assigned_hub_ids = set()
+    
+    for route_info in all_routes:
+        # Check if any hub in this route is already assigned
+        route_hub_ids = set(hub.id for hub in route_info['route']['hubs'])
+        if not assigned_hub_ids.intersection(route_hub_ids) and len(selected_routes) < len(available_trucks):
+            selected_routes.append(route_info)
+            assigned_hub_ids.update(route_hub_ids)
+    
+    return selected_routes
+
+
+def assign_trucks_to_routes(selected_routes):
+    """
+    Truck assignment: Assign physical trucks to routes.
+    """
+    # Sort trucks by fuel capacity (descending) for efficient assignment
+    sorted_trucks = sorted(world_state.trucks, key=lambda t: t.fuel_remaining, reverse=True)
+    
+    for i, route_info in enumerate(selected_routes):
+        if i < len(sorted_trucks):
+            truck = sorted_trucks[i]
+            route = route_info['route']
+            
+            # Assign the route to the truck
+            truck.route_plan = [hub.id for hub in route['hubs']]
+            truck.active = True
+            truck.cluster_id = f"SECTOR_{route_info['sector_idx']}"
+            
+            # Clear future task queue and populate with the assigned route
+            truck.future_task_queue = []
+            for hub in route['hubs']:
+                # Create task without urgency (using default urgency_weight of 0.0)
+                task = Task(hub_id=hub.id, urgency_weight=0.0, assigned_at=world_state.simulation_time)
+                truck.future_task_queue.append(task)
+            
+            # Assign hubs to this truck with ownership
+            for hub in route['hubs']:
+                hub_obj = next((h for h in world_state.hubs if h.id == hub.id), None)
+                if hub_obj:
+                    hub_obj.owner_truck_id = truck.id
+                    hub_obj.ownership_state = HubOwnershipState.ASSIGNED
+                    hub_obj.frozen_at_commit = True
+                    hub_obj.cluster_id = truck.cluster_id
+    
+    # Keep all trucks active but clear their plans
+    for i in range(len(selected_routes), len(sorted_trucks)):
+        sorted_trucks[i].active = True
+        sorted_trucks[i].route_plan = []
+        sorted_trucks[i].future_task_queue = []
+
+
+def fleet_optimized_assignment_algorithm():
+    """
+    Main fleet-level directional logistics optimization algorithm.
+    
+    Implements the complete workflow:
+    1. Canonical transformation to polar coordinates
+    2. Hard feasibility filtering
+    3. Directional sectorization
+    4. Sector-local hub ordering
+    5. Sector route construction
+    6. Route envelope cost computation
+    7. Sector demand summary
+    8. Global route selection
+    9. Truck assignment
+    
+    Returns True if commit was successful, False if any hub is unassigned.
+    """
+    # Get all hubs with demand (excluding central hub)
+    hubs_requiring_assignment = []
+    for hub in world_state.hubs:
+        if hub.id != CENTRAL_HUB["id"] and hub.demand_quantity > 0:
+            hubs_requiring_assignment.append(hub)
+    
+    print(f"[FLEET OPTIMIZATION] {len(hubs_requiring_assignment)} hubs require assignment")
+    
+    # If no hubs need service, commit is successful
+    if not hubs_requiring_assignment:
+        for truck in world_state.trucks:
+            truck.route_plan.clear()
+            truck.assigned_hubs.clear()
+            truck.status = "idle"
+            truck.future_task_queue = []
+        print("[FLEET OPTIMIZATION] No hubs to assign - commit successful")
+        # Set simulation phase to committed
+        world_state.simulation_phase = "committed"
+        return True
+    
+    # Get active trucks
+    active_trucks = [t for t in world_state.trucks if t.active]
+    if not active_trucks:
+        print("[FLEET OPTIMIZATION] No active trucks available - commit failed")
+        return False
+    
+    # Reset all truck states
+    for truck in world_state.trucks:
+        if truck.active:
+            truck.route_plan.clear()
+            truck.assigned_hubs.clear()
+            truck.completed_deliveries.clear()
+            truck.status = "idle"
+            truck.future_task_queue = []
+    
+    # Step 1: Transform to polar coordinates
+    polar_coords = compute_polar_coordinates()
+    
+    # Step 2: Filter hard feasibility
+    feasible_coords = filter_hard_feasibility(polar_coords)
+    
+    # Step 3: Create directional sectors
+    sectors = create_directional_sectors(feasible_coords, sector_width=30)
+    
+    # Step 4: Order hubs within each sector
+    sectors_ordered = {}
+    for sector_idx, hub_list in sectors.items():
+        sectors_ordered[sector_idx] = order_sector_hubs(hub_list)
+    
+    # Step 5: Construct routes within each sector
+    sectors_routes = {}
+    # Use the speed of the fastest truck for time calculations
+    fastest_truck = max(world_state.trucks, key=lambda t: t.speed) if world_state.trucks else None
+    truck_speed = fastest_truck.speed if fastest_truck else 50.0
+    
+    for sector_idx, ordered_hubs in sectors_ordered.items():
+        routes = construct_sector_routes(ordered_hubs, truck_speed)
+        sectors_routes[sector_idx] = routes
+    
+    # Step 6 & 7: Compute sector summaries
+    sector_summaries = compute_sector_summary(sectors_routes)
+    
+    # Step 8: Global route selection
+    selected_routes = select_global_routes(sectors_routes, active_trucks)
+    
+    # Step 9: Assign trucks to routes
+    assign_trucks_to_routes(selected_routes)
+    
+    # ===========================================
+    # COMMIT VALIDATION (UPDATED FOR OPTIMIZATION)
+    # ===========================================
+    # Allow unassigned hubs - only fail if no routes were selected at all
+    assigned_hub_ids = set()
+    for route_info in selected_routes:
+        for hub in route_info['route']['hubs']:
+            assigned_hub_ids.add(hub.id)
+    
+    # Check if any hubs remain unassigned
+    final_unassigned = []
+    for hub in hubs_requiring_assignment:
+        if hub.id not in assigned_hub_ids:
+            final_unassigned.append(hub)
+    
+    # Mark unassigned hubs appropriately
+    for hub in final_unassigned:
+        hub.ownership_state = HubOwnershipState.UNASSIGNED
+        hub.owner_truck_id = None
+        hub.cluster_id = None  # Clear cluster assignment
+        print(f"[FLEET OPTIMIZATION] Hub {hub.name} ({hub.id}) left unassigned due to constraints")
+    
+    # Only fail if no routes were selected at all (no feasible solution)
+    if not selected_routes and hubs_requiring_assignment:
+        print(f"[FLEET OPTIMIZATION FAILED] No feasible routes could be created for {len(hubs_requiring_assignment)} hubs")
+        return False
+    
+    # ===========================================
+    # FREEZE ASSIGNED HUBS ONLY
+    # ===========================================
+    # Mark only assigned hubs as frozen - unassigned hubs remain available
+    # DO NOT refreeze old hubs that are already frozen
+    for hub in hubs_requiring_assignment:
+        if hub.id in assigned_hub_ids and not hub.frozen_at_commit:
+            hub.frozen_at_commit = True
+    
+    # Store initial hub list for reference
+    world_state.initial_hubs_with_demand = [h.id for h in hubs_requiring_assignment]
+    
+    # Set simulation phase to committed
+    world_state.simulation_phase = "committed"
+    
+    # Log results
+    active_trucks = [t for t in world_state.trucks if t.active]
+    total_hubs_assigned = sum(len(route_info['route']['hubs']) for route_info in selected_routes)
+    total_fuel_estimate = sum(route_info['envelope_cost'] for route_info in selected_routes)
+    
+    print(f"[FLEET OPTIMIZATION] Routes selected: {len(selected_routes)}, Trucks used: {len(active_trucks)}, Hubs assigned: {total_hubs_assigned}, Hubs unassigned: {len(final_unassigned)}, Estimated fuel: {total_fuel_estimate:.2f}L")
+    
+    return True
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

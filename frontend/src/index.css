@@ -190,6 +190,17 @@ body {
   50% { opacity: 0.5; }
 }
 
+@keyframes slideDown {
+  0% {
+    transform: translate(-50%, -100px);
+    opacity: 0;
+  }
+  100% {
+    transform: translate(-50%, 0);
+    opacity: 1;
+  }
+}
+
 .ai-explanation {
   background: #f8f9fa;
   padding: 10px;

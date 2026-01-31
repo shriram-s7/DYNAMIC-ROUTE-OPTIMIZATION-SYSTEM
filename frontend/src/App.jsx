@@ -229,6 +229,13 @@ function App() {
 
   // Add Hub mode toggle (Manager only) - only available before start
   const [addHubMode, setAddHubMode] = useState(false)
+  
+  // State for route change banner
+  const [showRouteChangeBanner, setShowRouteChangeBanner] = useState(false)
+  const [routeChangeMessage, setRouteChangeMessage] = useState('')
+  
+  // Refs to track previous state for change detection
+  const prevTruckRoutes = useRef({})
 
   /* =========================
      MAP INITIALIZATION
@@ -522,11 +529,83 @@ useEffect(() => {
           el.style.fontSize = '24px'
           el.style.width = '30px'
           el.style.height = '30px'
-          el.style.background = '#007bff'
+          // Priority: is_late > replan_candidate > normal
+          if (hub.is_late) {
+            el.style.background = '#dc3545'  // Red for late
+            el.style.boxShadow = '0 0 8px rgba(220,53,69,0.8)'
+          } else if (hub.replan_candidate) {
+            el.style.background = '#ff6b35'  // Orange if replan candidate
+            el.style.boxShadow = '0 0 8px rgba(255,107,53,0.8)'
+          } else {
+            el.style.background = '#007bff'  // Blue otherwise
+            el.style.boxShadow = '0 0 8px rgba(0,123,255,0.6)'
+          }
           el.style.border = '2px solid #ffffff'
           el.style.borderRadius = '50%'
-          el.style.boxShadow = '0 0 8px rgba(0,123,255,0.6)'
-          el.title = `${hub.name} - ${hub.demand_priority} Priority`
+          
+          // Add is_late badge (⚠️) - highest priority
+          if (hub.is_late) {
+            // Clear any existing badges first
+            const existingBadges = el.querySelectorAll('.replan-badge, .late-badge');
+            existingBadges.forEach(b => b.remove());
+            
+            const badge = document.createElement('div');
+            badge.className = 'late-badge';
+            badge.innerHTML = '⚠️';
+            badge.style.position = 'absolute';
+            badge.style.top = '-5px';
+            badge.style.right = '-5px';
+            badge.style.width = '18px';
+            badge.style.height = '18px';
+            badge.style.background = '#dc3545';
+            badge.style.color = 'white';
+            badge.style.borderRadius = '50%';
+            badge.style.fontSize = '10px';
+            badge.style.display = 'flex';
+            badge.style.alignItems = 'center';
+            badge.style.justifyContent = 'center';
+            badge.style.border = '1px solid white';
+            badge.style.zIndex = '1001';
+            badge.style.pointerEvents = 'none';
+            badge.title = 'Will miss deadline';
+            el.appendChild(badge);
+          }
+          // Add replan badge (🔄) if not late
+          else if (hub.replan_candidate) {
+            // Clear any existing badges first
+            const existingBadges = el.querySelectorAll('.replan-badge, .late-badge');
+            existingBadges.forEach(b => b.remove());
+            
+            const badge = document.createElement('div');
+            badge.className = 'replan-badge';
+            badge.innerHTML = '🔄';
+            badge.style.position = 'absolute';
+            badge.style.top = '-5px';
+            badge.style.right = '-5px';
+            badge.style.width = '18px';
+            badge.style.height = '18px';
+            badge.style.background = '#ff3b30';
+            badge.style.color = 'white';
+            badge.style.borderRadius = '50%';
+            badge.style.fontSize = '10px';
+            badge.style.display = 'flex';
+            badge.style.alignItems = 'center';
+            badge.style.justifyContent = 'center';
+            badge.style.border = '1px solid white';
+            badge.style.zIndex = '1001';
+            badge.style.pointerEvents = 'none';
+            badge.title = 'Replan Required';
+            el.appendChild(badge);
+          }
+          
+          // Update title
+          if (hub.is_late) {
+            el.title = `${hub.name} - Will miss deadline (${hub.deadline_hours}h)`
+          } else if (hub.replan_candidate) {
+            el.title = `${hub.name} - Deadline changed, evaluating at next decision point`
+          } else {
+            el.title = `${hub.name} - Deadline: ${hub.deadline_hours}h`
+          }
         }
         
         // Set visibility based on role
@@ -598,11 +677,79 @@ useEffect(() => {
           el.style.fontSize = '24px'
           el.style.width = '30px'
           el.style.height = '30px'
-          el.style.background = '#007bff'
+          // Priority: is_late > replan_candidate > normal
+          if (hub.is_late) {
+            el.style.background = '#dc3545'  // Red for late
+            el.style.boxShadow = '0 0 8px rgba(220,53,69,0.8)'
+          } else if (hub.replan_candidate) {
+            el.style.background = '#ff6b35'  // Orange if replan candidate
+            el.style.boxShadow = '0 0 8px rgba(255,107,53,0.8)'
+          } else {
+            el.style.background = '#007bff'  // Blue otherwise
+            el.style.boxShadow = '0 0 8px rgba(0,123,255,0.6)'
+          }
           el.style.border = '2px solid #ffffff'
           el.style.borderRadius = '50%'
-          el.style.boxShadow = '0 0 8px rgba(0,123,255,0.6)'
-          el.title = `${hub.name} - ${hub.demand_priority} Priority`
+          
+          // Clear any existing badges first
+          const existingBadges = el.querySelectorAll('.replan-badge, .late-badge');
+          existingBadges.forEach(b => b.remove());
+          
+          // Add is_late badge (⚠️) - highest priority
+          if (hub.is_late) {
+            const badge = document.createElement('div');
+            badge.className = 'late-badge';
+            badge.innerHTML = '⚠️';
+            badge.style.position = 'absolute';
+            badge.style.top = '-5px';
+            badge.style.right = '-5px';
+            badge.style.width = '18px';
+            badge.style.height = '18px';
+            badge.style.background = '#dc3545';
+            badge.style.color = 'white';
+            badge.style.borderRadius = '50%';
+            badge.style.fontSize = '10px';
+            badge.style.display = 'flex';
+            badge.style.alignItems = 'center';
+            badge.style.justifyContent = 'center';
+            badge.style.border = '1px solid white';
+            badge.style.zIndex = '1001';
+            badge.style.pointerEvents = 'none';
+            badge.title = 'Will miss deadline';
+            el.appendChild(badge);
+          }
+          // Add replan badge (🔄) if not late
+          else if (hub.replan_candidate) {
+            const badge = document.createElement('div');
+            badge.className = 'replan-badge';
+            badge.innerHTML = '🔄';
+            badge.style.position = 'absolute';
+            badge.style.top = '-5px';
+            badge.style.right = '-5px';
+            badge.style.width = '18px';
+            badge.style.height = '18px';
+            badge.style.background = '#ff3b30';
+            badge.style.color = 'white';
+            badge.style.borderRadius = '50%';
+            badge.style.fontSize = '10px';
+            badge.style.display = 'flex';
+            badge.style.alignItems = 'center';
+            badge.style.justifyContent = 'center';
+            badge.style.border = '1px solid white';
+            badge.style.zIndex = '1001';
+            badge.style.pointerEvents = 'none';
+            badge.title = 'Replan Required';
+            el.appendChild(badge);
+          }
+          
+          // Update title
+          if (hub.is_late) {
+            el.title = `${hub.name} - Will miss deadline (${hub.deadline_hours}h)`
+          } else if (hub.replan_candidate) {
+            el.title = `${hub.name} - Deadline changed, evaluating at next decision point`
+          } else {
+            el.title = `${hub.name} - Deadline: ${hub.deadline_hours}h`
+          }
         }
         
         // Update visibility based on role
@@ -953,6 +1100,92 @@ useEffect(() => {
 
   }, [worldState])
 
+  // Effect to detect route changes and show banner
+  useEffect(() => {
+    if (!worldState || !worldState.trucks) return;
+    
+    // Check for route order changes in each truck
+    worldState.trucks.forEach(truck => {
+      const prevQueue = prevTruckRoutes.current[truck.id] || [];
+      const currentQueue = truck.future_task_queue || [];
+      
+      // Compare if the task queue has changed
+      if (prevQueue.length !== currentQueue.length) {
+        // Queue length changed, definitely a route change
+        setShowRouteChangeBanner(true);
+        setRouteChangeMessage('Route updated by system');
+        
+        // Highlight the new destination if there is one
+        if (currentQueue.length > 0) {
+          const newDestinationHubId = currentQueue[0]?.hub_id;
+          if (newDestinationHubId && markers.current.hubs[newDestinationHubId]) {
+            const hubMarkerEl = markers.current.hubs[newDestinationHubId].getElement();
+            if (hubMarkerEl) {
+              // Add temporary highlight effect
+              hubMarkerEl.style.transform = 'scale(1.2)';
+              hubMarkerEl.style.transition = 'transform 0.3s ease';
+              
+              // Remove highlight after 1.5 seconds
+              setTimeout(() => {
+                if (hubMarkerEl && hubMarkerEl.style) {
+                  hubMarkerEl.style.transform = 'scale(1)';
+                }
+              }, 1500);
+            }
+          }
+        }
+        
+        // Hide the banner after 3 seconds
+        setTimeout(() => {
+          setShowRouteChangeBanner(false);
+        }, 3000);
+      } else {
+        // Same length, check if order has changed
+        let orderChanged = false;
+        for (let i = 0; i < prevQueue.length; i++) {
+          if (prevQueue[i]?.hub_id !== currentQueue[i]?.hub_id || 
+              prevQueue[i]?.urgency_weight !== currentQueue[i]?.urgency_weight) {
+            orderChanged = true;
+            break;
+          }
+        }
+        
+        if (orderChanged) {
+          setShowRouteChangeBanner(true);
+          setRouteChangeMessage('Route updated by system');
+          
+          // Highlight the new destination if there is one
+          if (currentQueue.length > 0) {
+            const newDestinationHubId = currentQueue[0]?.hub_id;
+            if (newDestinationHubId && markers.current.hubs[newDestinationHubId]) {
+              const hubMarkerEl = markers.current.hubs[newDestinationHubId].getElement();
+              if (hubMarkerEl) {
+                // Add temporary highlight effect
+                hubMarkerEl.style.transform = 'scale(1.2)';
+                hubMarkerEl.style.transition = 'transform 0.3s ease';
+                
+                // Remove highlight after 1.5 seconds
+                setTimeout(() => {
+                  if (hubMarkerEl && hubMarkerEl.style) {
+                    hubMarkerEl.style.transform = 'scale(1)';
+                  }
+                }, 1500);
+              }
+            }
+          }
+          
+          // Hide the banner after 3 seconds
+          setTimeout(() => {
+            setShowRouteChangeBanner(false);
+          }, 3000);
+        }
+      }
+      
+      // Update the previous queue for next comparison
+      prevTruckRoutes.current[truck.id] = [...currentQueue];
+    });
+  }, [worldState]);
+
   // Effect for follow mode - center map on selected truck when in driver role
   useEffect(() => {
     if (role === 'driver' && selectedTruck && worldState && map.current) {
@@ -1075,14 +1308,25 @@ useEffect(() => {
 
   const handleCreateHub = async (hubData) => {
     try {
-      await axios.post(`${API_BASE}/hubs/manual`, {
+      // Validate deadline_hours is provided
+      if (!hubData.deadline_hours || hubData.deadline_hours <= 0) {
+        alert('Deadline hours is required and must be positive')
+        return
+      }
+      
+      const payload = {
         name: hubData.name,
         latitude: hubModal.lat,
         longitude: hubModal.lng,
         demand_quantity: parseInt(hubData.demand_quantity),
-        demand_priority: hubData.demand_priority,
+        deadline_hours: parseFloat(hubData.deadline_hours),  // REQUIRED: Explicit conversion to float
         availability: parseInt(hubData.availability || 20)  // Set default availability to 20 as per requirements
-      })
+      }
+      
+      // Log payload for debugging
+      console.log('[FRONTEND] Creating hub with payload:', payload)
+      
+      await axios.post(`${API_BASE}/hubs/manual`, payload)
       setHubModal({ show: false, mode: 'create', hub: null, lat: null, lng: null })
     } catch (error) {
       console.error('Error creating hub:', error)
@@ -1092,9 +1336,8 @@ useEffect(() => {
 
   const handleUpdateHub = async (hubData) => {
     try {
-      await axios.put(`${API_BASE}/hubs/${hubModal.hub.id}/demand`, {
+      await axios.put(`${API_BASE}/hubs/${hubModal.hub.id}`, {
         demand_quantity: parseInt(hubData.demand_quantity),
-        demand_priority: hubData.demand_priority
       })
       setHubModal({ show: false, mode: 'edit', hub: null, lat: null, lng: null })
     } catch (error) {
@@ -1119,7 +1362,7 @@ useEffect(() => {
   const handleCreateRandomHubs = async () => {
     try {
       await axios.post(`${API_BASE}/hubs/random`)
-      alert('Successfully created 4 random hubs!')
+      alert('Successfully created some random hubs!')
     } catch (error) {
       console.error('Error creating random hubs:', error)
       alert('Failed to create random hubs: ' + (error.response?.data?.detail || error.message))
@@ -1309,7 +1552,29 @@ useEffect(() => {
       ) : (
         <>
           <div ref={mapContainer} style={{ position: 'absolute', inset: 0, cursor: placementMode ? 'crosshair' : 'default' }} />
-  
+          
+          {/* Route Change Banner */}
+          {showRouteChangeBanner && (
+            <div style={{
+              position: 'fixed',
+              top: '12px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              backgroundColor: '#2ecc71',
+              color: 'white',
+              padding: '10px 20px',
+              borderRadius: '4px',
+              boxShadow: '0 2px 10px rgba(0,0,0,0.2)',
+              zIndex: 2000,
+              fontWeight: 'bold',
+              fontSize: '14px',
+              textAlign: 'center',
+              animation: 'slideDown 0.3s ease-in-out'
+            }}>
+              {routeChangeMessage}
+            </div>
+          )}
+          
           {/* Simulation Control Bar */}
           <div style={{
             position: 'fixed',
@@ -1409,7 +1674,7 @@ useEffect(() => {
                   <HubForm
                     onSubmit={handleCreateHub}
                     onCancel={() => setHubModal({ show: false, mode: 'create', hub: null, lat: null, lng: null })}
-                    initialData={{ name: '', demand_quantity: 1, demand_priority: 'Medium', availability: 100 }}
+                    initialData={{ name: '', demand_quantity: 1, availability: 100, deadline_hours: 24.0 }}
                   />
                 ) : (
                   <HubForm
@@ -1419,7 +1684,9 @@ useEffect(() => {
                     initialData={{
                       name: hubModal.hub?.name || '',
                       demand_quantity: hubModal.hub?.demand_quantity || 1,
-                      demand_priority: hubModal.hub?.demand_priority || 'Medium'
+                      deadline_hours: hubModal.hub?.deadline_hours || 24.0,
+                      id: hubModal.hub?.id,
+                      replan_candidate: hubModal.hub?.replan_candidate
                     }}
                     isEdit={true}
                   />
@@ -1499,12 +1766,12 @@ useEffect(() => {
                       width: '100%'
                     }}
                   >
-                    🎯 Create 3 Fixed Hubs
+                    🎯 Create Fixed Hubs
                   </button>
                 </div>
 
-                {/* Hub List Panel - Manager only, before simulation starts */}
-                {role === 'manager' && !simulationStarted && (
+                {/* Hub List Panel - Manager only, available at all times */}
+                {role === 'manager' && (
                   <div style={{ marginTop: '15px' }}>
                     <h4>📍 Hubs</h4>
                     <div style={{ maxHeight: '200px', overflowY: 'auto', border: '1px solid #ddd', borderRadius: '4px', padding: '10px' }}>
@@ -1523,30 +1790,50 @@ useEffect(() => {
                             {hub.name} ({hub.demand_quantity} units, {hub.distance_from_trichy_km?.toFixed(1) || 'N/A'} km)
                           </span>
                           {hub.id !== 'CENTRAL_DEPOT' ? (
-                            <button 
-                              onClick={async () => {
-                                if (window.confirm('Delete this hub permanently?')) {
-                                  try {
-                                    await axios.delete(`${API_BASE}/hubs/${hub.id}`);
-                                    // The state will be updated by the polling mechanism
-                                  } catch (error) {
-                                    console.error('Error deleting hub:', error);
-                                    alert('Failed to delete hub: ' + (error.response?.data?.detail || error.message));
+                            simulationStarted ? (
+                              // Show disabled delete button after simulation starts
+                              <button 
+                                disabled
+                                style={{
+                                  padding: '4px 8px',
+                                  backgroundColor: '#6c757d',
+                                  color: 'white',
+                                  border: 'none',
+                                  borderRadius: '4px',
+                                  cursor: 'not-allowed',
+                                  fontSize: '12px'
+                                }}
+                                title="Hubs cannot be deleted after simulation start"
+                              >
+                                🗑 Delete
+                              </button>
+                            ) : (
+                              // Show enabled delete button before simulation starts
+                              <button 
+                                onClick={async () => {
+                                  if (window.confirm('Delete this hub permanently?')) {
+                                    try {
+                                      await axios.delete(`${API_BASE}/hubs/${hub.id}`);
+                                      // The state will be updated by the polling mechanism
+                                    } catch (error) {
+                                      console.error('Error deleting hub:', error);
+                                      alert('Failed to delete hub: ' + (error.response?.data?.detail || error.message));
+                                    }
                                   }
-                                }
-                              }}
-                              style={{
-                                padding: '4px 8px',
-                                backgroundColor: '#dc3545',
-                                color: 'white',
-                                border: 'none',
-                                borderRadius: '4px',
-                                cursor: 'pointer',
-                                fontSize: '12px'
-                              }}
-                            >
-                              🗑 Delete
-                            </button>
+                                }}
+                                style={{
+                                  padding: '4px 8px',
+                                  backgroundColor: '#dc3545',
+                                  color: 'white',
+                                  border: 'none',
+                                  borderRadius: '4px',
+                                  cursor: 'pointer',
+                                  fontSize: '12px'
+                                }}
+                              >
+                                🗑 Delete
+                              </button>
+                            )
                           ) : (
                             <span style={{ color: '#6c757d', fontSize: '12px' }}>🔒</span>
                           )}
@@ -1587,7 +1874,7 @@ useEffect(() => {
               <>
                 <h3 style={{ marginTop: '15px', color: '#28a745' }}>🟢 System Active ({worldState?.simulation_phase || 'executing'})</h3>
                 <p style={{ fontSize: '12px', color: '#666', fontStyle: 'italic' }}>
-                  All hubs committed and frozen. Adjust demand intensity sliders to influence truck routing.
+                  All hubs committed and frozen. Edit delivery deadlines to influence routing at the next safe decision point.
                   Changes take effect at the next safe decision point.
                 </p>
                 
@@ -1687,24 +1974,24 @@ useEffect(() => {
                 </div>
                 )}
                 
-                {/* Hub demand intensity sliders - THE ONLY RUNTIME INTERACTION */}
+                {/* Hub deadline controls - THE ONLY RUNTIME INTERACTION */}
                 {role === 'manager' && (
                 <div style={{ marginTop: '15px' }}>
-                  <h4>Demand Pressure Controls</h4>
+                  <h4>Delivery Deadlines</h4>
                   <p style={{ fontSize: '11px', color: '#888', marginBottom: '10px' }}>
-                    Low → Medium → High → Emergency
+                    Edit delivery deadlines. Changes are evaluated conservatively at the next safe decision point.
                   </p>
                   {worldState?.hubs?.filter(h => h.id !== 'CENTRAL_DEPOT' && !h.delivered).map(hub => (
-                    <DemandSlider 
+                    <HubDeadlineCard 
                       key={hub.id} 
                       hub={hub} 
-                      onIntensityChange={async (hubId, intensity) => {
+                      onDeadlineChange={async (hubId, deadlineHours) => {
                         try {
-                          await axios.put(`${API_BASE}/hubs/${hubId}/intensity`, {
-                            demand_intensity: intensity
+                          await axios.put(`${API_BASE}/hubs/${hubId}/deadline`, {
+                            deadline_hours: deadlineHours
                           })
                         } catch (error) {
-                          console.error('Error updating intensity:', error)
+                          console.error('Error updating deadline:', error)
                         }
                       }}
                     />
@@ -1747,7 +2034,7 @@ useEffect(() => {
             {role === 'manager' && (
             <div style={{position: 'fixed',bottom: '20px',right: '20px',width: '250px',backgroundColor: 'white',padding: '15px',borderRadius: '8px',boxShadow: '0 4px 12px rgba(0,0,0,0.15)',zIndex: 2000,border: '1px solid #ddd'}}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
-                <h4 style={{ margin: '0', color: '#2c3e50' }}>🚨 Disasters</h4>
+                <h4 style={{ margin: '0', color: '#2c3e50' }}>Factors</h4>
                 <button
                   onClick={() => setActiveMode(activeMode === 'disaster' ? 'monitoring' : 'disaster')}
                   style={{
@@ -1768,11 +2055,11 @@ useEffect(() => {
               {activeMode === 'disaster' && (
               <>
               <div style={{ marginBottom: '10px' }}>
-                <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>Select Disaster:</label>
+                <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>Select Factor:</label>
                 <div style={{ display: 'flex', gap: '5px' }}>
                   <button onClick={() => toggleDisaster('rain')} style={{flex: 1,padding: '5px 10px',backgroundColor: placementMode && disasterType === 'rain' ? '#3498db' : '#ecf0f1',color: placementMode && disasterType === 'rain' ? 'white' : '#2c3e50',border: '1px solid #bdc3c7',borderRadius: '4px',cursor: 'pointer'}}>🌧 Rain {placementMode && disasterType === 'rain' ? '(ON)' : ''}</button>
                   <button onClick={() => toggleDisaster('traffic')} style={{flex: 1,padding: '5px 10px',backgroundColor: placementMode && disasterType === 'traffic' ? '#f39c12' : '#ecf0f1',color: placementMode && disasterType === 'traffic' ? 'white' : '#2c3e50',border: '1px solid #bdc3c7',borderRadius: '4px',cursor: 'pointer'}}>🚦 Traffic {placementMode && disasterType === 'traffic' ? '(ON)' : ''}</button>
-                  <button onClick={() => toggleDisaster('road_block')} style={{flex: 1,padding: '5px 10px',backgroundColor: placementMode && disasterType === 'road_block' ? '#e74c3c' : '#ecf0f1',color: placementMode && disasterType === 'road_block' ? 'white' : '#2c3e50',border: '1px solid #bdc3c7',borderRadius: '4px',cursor: 'pointer'}}>🚧 Road Block {placementMode && disasterType === 'road_block' ? '(ON)' : ''}</button>
+                  {/*<button onClick={() => toggleDisaster('road_block')} style={{flex: 1,padding: '5px 10px',backgroundColor: placementMode && disasterType === 'road_block' ? '#e74c3c' : '#ecf0f1',color: placementMode && disasterType === 'road_block' ? 'white' : '#2c3e50',border: '1px solid #bdc3c7',borderRadius: '4px',cursor: 'pointer'}}>🚧 Road Block {placementMode && disasterType === 'road_block' ? '(ON)' : ''}</button>*/}
                 </div>
               </div>
               
@@ -2039,22 +2326,50 @@ function HubForm({ onSubmit, onCancel, onDelete, initialData, isEdit = false }) 
       </div>
       <div style={{ marginBottom: '15px' }}>
         <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>
-          Demand Priority
+          Delivery Deadline (hours)
         </label>
-        <select
-          value={formData.demand_priority}
-          onChange={(e) => setFormData({ ...formData, demand_priority: e.target.value })}
+        <input
+          type="number"
+          step="0.5"
+          min="0.5"
+          max="48"
+          value={formData.deadline_hours}
+          onChange={(e) => setFormData({ ...formData, deadline_hours: parseFloat(e.target.value) })}
           style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid #ccc' }}
           required
-        >
-          <option value="Low">Low</option>
-          <option value="Medium">Medium</option>
-          <option value="High">High</option>
-          <option value="Emergency">Emergency</option>
-        </select>
+        />
+        <small style={{ color: '#666', fontSize: '11px' }}>
+          Hours from simulation start. Planning guarantees deadline feasibility.
+        </small>
       </div>
       <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
-        {onDelete && (
+        {formData.replan_candidate && (
+          <button
+            type="button"
+            onClick={async () => {
+              try {
+                await axios.post(`${API_BASE}/hubs/${formData.id}/confirm-replan`);
+                alert('Replan confirmed successfully!');
+                // Close the modal after confirmation
+                onCancel();
+              } catch (error) {
+                console.error('Error confirming replan:', error);
+                alert('Failed to confirm replan: ' + (error.response?.data?.detail || error.message));
+              }
+            }}
+            style={{
+              padding: '8px 16px',
+              backgroundColor: '#ff6b35',  // Orange color
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer'
+            }}
+          >
+            Confirm Replan
+          </button>
+        )}
+        {onDelete && !simulationStarted && (
           <button
             type="button"
             onClick={onDelete}
@@ -2066,7 +2381,7 @@ function HubForm({ onSubmit, onCancel, onDelete, initialData, isEdit = false }) 
               borderRadius: '4px',
               cursor: 'pointer'
             }}
-            title={!simulationStarted ? '' : 'Hubs cannot be deleted after simulation start'}
+            title="Hubs cannot be deleted after simulation start"
           >
             Delete Hub
           </button>
@@ -2103,21 +2418,45 @@ function HubForm({ onSubmit, onCancel, onDelete, initialData, isEdit = false }) 
   )
 }
 
-// Demand Intensity Slider Component
-// THE ONLY RUNTIME INTERACTION - controls urgency pressure on hubs
-function DemandSlider({ hub, onIntensityChange }) {
-  const intensityLevels = ['Low', 'Medium', 'High', 'Emergency']
-  const currentIndex = intensityLevels.indexOf(hub.demand_intensity || 'Medium')
+// Hub Deadline Card Component
+// THE ONLY RUNTIME INTERACTION - controls delivery deadlines
+function HubDeadlineCard({ hub, onDeadlineChange }) {
+  const [deadlineValue, setDeadlineValue] = useState(hub.deadline_hours || 24.0)
+  const [isPending, setIsPending] = useState(false)
+  const [showRejectMessage, setShowRejectMessage] = useState(false)
+  const prevReplanCandidate = useRef(hub.replan_candidate)
+  const pendingDeadlineValue = useRef(null)
   
-  const getIntensityColor = (intensity) => {
-    switch(intensity) {
-      case 'Emergency': return '#dc3545'  // Red
-      case 'High': return '#fd7e14'       // Orange
-      case 'Medium': return '#ffc107'     // Yellow
-      case 'Low': return '#28a745'        // Green
-      default: return '#6c757d'
+  useEffect(() => {
+    const newDeadline = hub.deadline_hours || 24.0
+    setDeadlineValue(newDeadline)
+    
+    // Detect if reorder was rejected:
+    // - We were pending a deadline change
+    // - Deadline was updated (matches our pending value)
+    // - replan_candidate went from true to false (backend processed but rejected reorder)
+    if (isPending && pendingDeadlineValue.current !== null && 
+        Math.abs(newDeadline - pendingDeadlineValue.current) < 0.1 &&
+        prevReplanCandidate.current && !hub.replan_candidate) {
+      // Reorder was rejected - show message
+      setShowRejectMessage(true)
+      setIsPending(false)
+      pendingDeadlineValue.current = null
+      // Hide message after 5 seconds
+      setTimeout(() => setShowRejectMessage(false), 5000)
+    } else if (isPending && Math.abs(newDeadline - deadlineValue) < 0.1) {
+      // Deadline change was processed (either accepted or rejected, but not at decision point yet)
+      // Keep pending until replan_candidate changes
+      if (!hub.replan_candidate && prevReplanCandidate.current) {
+        // Was pending, now processed - could be acceptance or rejection
+        // If deadline matches and replan_candidate cleared, likely rejection
+        setIsPending(false)
+        pendingDeadlineValue.current = null
+      }
     }
-  }
+    
+    prevReplanCandidate.current = hub.replan_candidate
+  }, [hub.deadline_hours, hub.replan_candidate])
   
   const getOwnershipBadge = () => {
     if (hub.ownership_state === 'COMPLETED') {
@@ -2131,39 +2470,55 @@ function DemandSlider({ hub, onIntensityChange }) {
   
   const getFrozenBadge = () => {
     if (hub.frozen_at_commit) {
-      return { text: '🔒 Committed', color: '#6c757d' }
+      return { text: 'COMMITTED ✔', color: '#6c757d' }
     }
     return null
   }
   
-  const handleSliderChange = (e) => {
-    const newIndex = parseInt(e.target.value)
-    const newIntensity = intensityLevels[newIndex]
-    onIntensityChange(hub.id, newIntensity)
+  const handleDeadlineChange = async (newValue) => {
+    const numValue = parseFloat(newValue)
+    if (isNaN(numValue) || numValue < 0.5 || numValue > 48) return
+    
+    setDeadlineValue(numValue)
+    setIsPending(true)
+    pendingDeadlineValue.current = numValue
+    setShowRejectMessage(false) // Clear any previous rejection message
+    
+    try {
+      await onDeadlineChange(hub.id, numValue)
+      // Keep pending state - will be cleared when state updates
+    } catch (error) {
+      console.error('Error updating deadline:', error)
+      setDeadlineValue(hub.deadline_hours || 24.0) // Revert on error
+      setIsPending(false)
+      pendingDeadlineValue.current = null
+    }
   }
   
   const ownership = getOwnershipBadge()
   const frozen = getFrozenBadge()
+  const isLate = hub.is_late && hub.ownership_state !== 'COMPLETED'
+  const isReplanCandidate = hub.replan_candidate && hub.ownership_state === 'ASSIGNED'
   
   return (
     <div style={{ 
-      padding: '10px', 
-      margin: '6px 0', 
+      padding: '12px', 
+      margin: '8px 0', 
       background: '#f8f9fa', 
       borderRadius: '6px',
-      border: `2px solid ${getIntensityColor(hub.demand_intensity || 'Medium')}`,
-      transition: 'border-color 0.3s ease'
+      border: '1px solid #ddd'
     }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-        <span style={{ fontWeight: 'bold', fontSize: '13px' }}>{hub.name}</span>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+        <span style={{ fontWeight: 'bold', fontSize: '14px' }}>{hub.name}</span>
         <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
           {frozen && (
             <span style={{ 
               fontSize: '9px', 
-              padding: '2px 4px', 
-              borderRadius: '6px',
+              padding: '2px 6px', 
+              borderRadius: '4px',
               backgroundColor: frozen.color,
-              color: 'white'
+              color: 'white',
+              fontWeight: 'bold'
             }}>
               {frozen.text}
             </span>
@@ -2171,47 +2526,63 @@ function DemandSlider({ hub, onIntensityChange }) {
           <span style={{ 
             fontSize: '10px', 
             padding: '2px 6px', 
-            borderRadius: '8px',
+            borderRadius: '4px',
             backgroundColor: ownership.color,
             color: 'white',
             fontWeight: 'bold'
           }}>
             {ownership.text}
           </span>
-          <span style={{ 
-            fontSize: '11px', 
-            padding: '2px 8px', 
-            borderRadius: '10px',
-            backgroundColor: getIntensityColor(hub.demand_intensity || 'Medium'),
-            color: 'white',
-            fontWeight: 'bold'
-          }}>
-            {hub.demand_intensity || 'Medium'}
-          </span>
         </div>
       </div>
       
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-        <span style={{ fontSize: '10px', color: '#28a745' }}>🟢</span>
-        <input
-          type="range"
-          min="0"
-          max="3"
-          value={currentIndex >= 0 ? currentIndex : 1}
-          onChange={handleSliderChange}
-          style={{ 
-            flex: 1,
-            height: '6px',
-            cursor: 'pointer',
-            accentColor: getIntensityColor(hub.demand_intensity || 'Medium')
-          }}
-        />
-        <span style={{ fontSize: '10px', color: '#dc3545' }}>🔴</span>
+      <div style={{ marginBottom: '8px' }}>
+        <label style={{ display: 'block', fontSize: '12px', fontWeight: 'bold', marginBottom: '4px', color: '#333' }}>
+          Delivery Deadline (hours):
+        </label>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <input
+            type="number"
+            step="0.5"
+            min="0.5"
+            max="48"
+            value={deadlineValue}
+            onChange={(e) => setDeadlineValue(parseFloat(e.target.value) || 0.5)}
+            onBlur={(e) => handleDeadlineChange(e.target.value)}
+            style={{ 
+              flex: 1,
+              padding: '6px 8px',
+              borderRadius: '4px',
+              border: '1px solid #ccc',
+              fontSize: '13px'
+            }}
+          />
+          <span style={{ fontSize: '12px', color: '#666' }}>hrs</span>
+        </div>
+        {isPending && (
+          <div style={{ fontSize: '10px', color: '#ff9800', marginTop: '4px' }}>
+            Pending decision point
+          </div>
+        )}
+        {isLate && !isPending && (
+          <div style={{ fontSize: '10px', color: '#dc3545', marginTop: '4px' }}>
+            Will miss deadline
+          </div>
+        )}
+        {isReplanCandidate && !isPending && !isLate && (
+          <div style={{ fontSize: '10px', color: '#ff9800', marginTop: '4px' }}>
+            Evaluated at next decision point
+          </div>
+        )}
+        {showRejectMessage && (
+          <div style={{ fontSize: '10px', color: '#6c757d', marginTop: '4px', fontStyle: 'italic' }}>
+            Deadline change evaluated — no safe reroute available.
+          </div>
+        )}
       </div>
       
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '4px', fontSize: '10px', color: '#666' }}>
-        <span>Demand: {hub.demand_quantity}</span>
-        <span>Priority: {hub.demand_priority}</span>
+      <div style={{ fontSize: '10px', color: '#666', marginTop: '4px' }}>
+        Deadline changes apply at the next safe decision point.
       </div>
     </div>
   )
