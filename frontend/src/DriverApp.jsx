@@ -2,19 +2,16 @@ import React from 'react';
 import { BrowserRouter as Router, Routes, Route, useParams } from 'react-router-dom';
 import DriverView from './DriverView';
 import './index.css';
-
 function DriverApp() {
-  // Component to extract truckId from URL and pass it to DriverView
   const TruckView = () => {
     const { truckId } = useParams();
     return <DriverView truckId={truckId} />;
   };
-
   return (
     <Router>
       <Routes>
         <Route path="/driver/:truckId" element={<TruckView />} />
-        {/* Fallback route */}
+        {}
         <Route path="*" element={
           <div style={{
             display: 'flex',
@@ -35,5 +32,4 @@ function DriverApp() {
     </Router>
   );
 }
-
 export default DriverApp;
