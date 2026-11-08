@@ -87,7 +87,7 @@ python main.py          # http://localhost:8000
 ```powershell
 cd frontend
 npm install
-npm run dev             # Vite dev server (see terminal for URL)
+npm run dev             # http://localhost:3000
 ```
 
 **Linux / macOS**
@@ -101,10 +101,10 @@ cd frontend && npm install && npm run dev
 
 ## Usage
 
-1. Open the frontend URL printed by Vite.
+1. Open http://localhost:3000.
 2. Upload a **Hubs CSV** and `sample_data/trucks.csv` (a hubs sample is not included in this repository; see below), or add hubs manually/randomly.
 3. Press **Start**, then toggle disruptions and edit hub demand to watch trucks re-plan.
-4. Open `driver.html` for the driver's view.
+4. Open `http://localhost:3000/driver.html` for the driver's view.
 
 CSV columns: hubs need `id,name,latitude,longitude,demand_quantity` (optional `availability,demand_intensity,deadline_hours`); trucks use `id,fuel_capacity,cost_per_km,max_deliveries,speed_kmph,mileage_kmpl,active`, as in `sample_data/trucks.csv`.
 
