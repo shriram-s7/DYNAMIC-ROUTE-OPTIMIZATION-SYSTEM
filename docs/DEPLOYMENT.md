@@ -11,6 +11,7 @@ The backend keeps one in-memory `WorldState` and advances it in a background thr
 | `frontend/public/demo-worker.js` | SharedWorker (Worker fallback). Loads Pyodide, installs FastAPI, boots the backend. Shared so the Driver View pop-up sees the same simulation. |
 | `frontend/public/py/bridge.py` | Dispatches requests straight into the FastAPI ASGI app, replaces the simulation thread with a `tick()` driven by the worker, and shims `requests` with synchronous XHR so OSRM road routing still works (straight-line fallback otherwise). |
 | `frontend/src/demoAdapter.js` | axios adapter that sends every API call to the worker; preloads `public/demo-trucks.csv` after each reset. Active only when built with `VITE_DEMO_MODE=true`. |
+| `frontend/src/demoGuide.js` | Demo-only guided tour: highlights the real buttons, advances as the visitor acts, and warns when the browser blocks the driver pop-up. Not loaded in the normal prototype. |
 | `frontend/scripts/copy-backend.mjs` | Copies `backend/main.py` and `route_assignment_algorithm.py` into `public/py/` so the demo runs the real code. |
 
 Code changes made to the backend for this: the loop body was extracted into `simulation_tick()` (the local server still calls it in the same loop), and the random-hub auto-seed of default trucks was fixed (wrong import and missing required `Truck` fields).

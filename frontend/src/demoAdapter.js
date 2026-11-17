@@ -35,7 +35,7 @@ function banner() {
   setStatus('Starting in-browser backend (first load takes ~15-30s)...');
 }
 banner();
-ready.then(() => { setStatus('Live demo: backend running in your browser. 3-truck demo fleet preloaded'); setTimeout(() => setStatus(''), 4000); },
+ready.then(() => { setStatus(location.pathname.includes('driver') ? 'Driver view: it shows your truck once the simulation has been started in the manager window' : 'Live demo: backend running in your browser. 3-truck demo fleet preloaded'); setTimeout(() => setStatus(''), 4000); },
            (e) => setStatus('Demo failed to start: ' + e.message));
 
 const inflightGets = new Map();

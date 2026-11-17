@@ -10,9 +10,12 @@ A real-time logistics simulator and dispatcher for a central-depot truck fleet. 
 
 Open **[https://optiflow-dro.vercel.app](https://optiflow-dro.vercel.app)**. The hosted version is the full app: the unmodified FastAPI backend (`backend/main.py`) runs inside your browser through Pyodide (WebAssembly) in a web worker, and the React frontend talks to it exactly as it would talk to a server. All features work: manager view, driver view, disruptions, demand edits, instructions.
 
-1. Wait for the "backend running in your browser" notice (first load downloads Python, about 15-30 s).
-2. A 3-truck demo fleet is preloaded. Click **Create Fixed Hubs** (dismiss the pop-up), then **Start**.
-3. Add rain/traffic/roadblocks, edit hub demand or deadlines, and open **Driver View** (a pop-up that shares the same live simulation).
+An **interactive guided tour** opens on first visit. It highlights each button to click and advances as you go (reopen it any time with the **🧭 Guide** button). The steps:
+
+1. Wait for the "backend running in your browser" notice (first load downloads Python, about 15-30 s). A 3-truck fleet is preloaded.
+2. Click **Create Fixed Hubs** (dismiss the pop-up), then **Start**.
+3. Speed up the clock, click **Add Impact → 🌧 Add Rain** and drop it on the map, and edit hub deadlines or demand.
+4. Click **Driver View**, pick a truck, then **Open in Driver View**. This opens the separate Google-Maps-style navigation window (`driver.html`) that follows the truck live. Allow pop-ups for the site if it does not open.
 
 The simulation state lives in your browser tab and resets on reload. Why a static host works, and how to deploy it yourself: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
