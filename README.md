@@ -2,7 +2,19 @@
 
 A real-time logistics simulator and dispatcher for a central-depot truck fleet. Trucks are assigned delivery hubs under hard deadline, driving-time and fuel constraints, and the plan is re-evaluated live when demand changes or disruptions (rain, traffic, roadblocks, disasters) occur.
 
+**Live demo: [https://optiflow-dro.vercel.app](https://optiflow-dro.vercel.app)** (runs the real backend in your browser, no install)
+
 **Links:** [GitHub](https://github.com/shriram-s7/DYNAMIC-ROUTE-OPTIMIZATION-SYSTEM) · [Demo video](https://youtu.be/uunL2gQFaAw) · Successor project: [diary-flow (DairyFlow)](https://github.com/shriram-s7/diary-flow), which grew out of this system
+
+## Live demo
+
+Open **[https://optiflow-dro.vercel.app](https://optiflow-dro.vercel.app)**. The hosted version is the full app: the unmodified FastAPI backend (`backend/main.py`) runs inside your browser through Pyodide (WebAssembly) in a web worker, and the React frontend talks to it exactly as it would talk to a server. All features work: manager view, driver view, disruptions, demand edits, instructions.
+
+1. Wait for the "backend running in your browser" notice (first load downloads Python, about 15-30 s).
+2. A 3-truck demo fleet is preloaded. Click **Create Fixed Hubs** (dismiss the pop-up), then **Start**.
+3. Add rain/traffic/roadblocks, edit hub demand or deadlines, and open **Driver View** (a pop-up that shares the same live simulation).
+
+The simulation state lives in your browser tab and resets on reload. Why a static host works, and how to deploy it yourself: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## Overview
 
@@ -49,11 +61,12 @@ The core algorithm (see `ALGORITHM_DESIGN.md`) is **Deadline-First Feasible Inse
 
 | Layer | Technology |
 |---|---|
-| Backend | Python, FastAPI, Uvicorn, Pydantic |
+| Backend | Python, FastAPI, Uvicorn, Pydantic (in the hosted demo: the same code on Pyodide/WebAssembly) |
 | Routing data | OSRM public API (`requests`), haversine fallback |
 | Frontend | React, React Router, Axios, Vite |
 | Map | MapLibre GL JS |
 | State | In-memory (lost on restart) |
+| Hosting | Vercel (static build; backend runs client-side via Pyodide) |
 
 ## Project structure
 
@@ -65,7 +78,10 @@ backend/
 frontend/
   src/App.jsx, DriverApp.jsx ...   manager and driver React apps
   index.html, driver.html          two entry pages
-sample_data/trucks.csv             example fleet
+  public/py/bridge.py              browser bridge that hosts backend/main.py (demo)
+  public/demo-worker.js            Pyodide worker (demo); src/demoAdapter.js routes axios to it
+  vercel.json                      Vercel build config
+sample_data/trucks.csv             example fleet (5 trucks)
 ALGORITHM_DESIGN.md, docs/         algorithm and system design notes
 media/                             demo video
 ```
@@ -114,6 +130,7 @@ There is no automated test suite in this repository.
 
 ## Status and limitations
 
+- The hosted demo needs a modern desktop browser and internet (Pyodide and map tiles come from CDNs); its state is per browser, not shared between visitors. The 5-truck `sample_data/trucks.csv` can make the strict commit check abort for the fixed hubs, so the demo preloads a 3-truck fleet.
 - Working prototype; state is a single in-memory object, so there is no persistence or multi-user safety.
 - Decision-making is rule-based. The "AI" wording in the older design docs refers to these heuristics.
 - `docs/SETUP.md` mentions `sample_data/hubs.csv`, which is not committed; supply your own hubs CSV.

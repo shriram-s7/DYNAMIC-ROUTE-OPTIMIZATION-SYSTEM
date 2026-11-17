@@ -1,5 +1,9 @@
 # Setup Instructions
 
+## Hosted demo (no setup)
+
+Open https://optiflow-dro.vercel.app. See [DEPLOYMENT.md](DEPLOYMENT.md) for how it works and how to run the demo build locally (`cd frontend && npm run dev:demo`).
+
 ## Quick Start
 
 ### 1. Backend Setup

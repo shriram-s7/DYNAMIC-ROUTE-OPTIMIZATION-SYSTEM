@@ -201,6 +201,10 @@ Frontend runs on `http://localhost:3000`
 │   │   ├── main.jsx         # React entry point
 │   │   └── index.css        # Styles
 │   ├── index.html           # HTML template
+│   ├── public/py/bridge.py  # Demo: hosts backend/main.py in-browser (Pyodide)
+│   ├── public/demo-worker.js# Demo: worker that loads Pyodide + FastAPI
+│   ├── src/demoAdapter.js   # Demo: routes axios calls to the worker
+│   ├── vercel.json          # Vercel build config
 │   ├── package.json         # Node dependencies
 │   └── vite.config.js       # Vite configuration
 ├── sample_data/
@@ -209,6 +213,7 @@ Frontend runs on `http://localhost:3000`
 └── docs/
     ├── SYSTEM_DESIGN.md     # Architecture details
     ├── SETUP.md             # Setup instructions
+    ├── DEPLOYMENT.md        # Hosted demo (Vercel + Pyodide)
     └── IMPLEMENTATION_SUMMARY.md  # This file
 ```
 

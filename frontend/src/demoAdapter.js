@@ -35,7 +35,7 @@ function banner() {
   setStatus('Starting in-browser backend (first load takes ~15-30s)...');
 }
 banner();
-ready.then(() => { setStatus('Live demo: backend running in your browser. Sample fleet of 5 trucks preloaded'); setTimeout(() => setStatus(''), 4000); },
+ready.then(() => { setStatus('Live demo: backend running in your browser. 3-truck demo fleet preloaded'); setTimeout(() => setStatus(''), 4000); },
            (e) => setStatus('Demo failed to start: ' + e.message));
 
 const inflightGets = new Map();
@@ -72,10 +72,10 @@ async function doRequest(config) {
     pending.set(id, resolve);
     port.postMessage({ id, method: config.method, url: url.pathname + url.search, body, contentType });
   });
-  // Demo convenience: after a reset, preload the 5-truck sample fleet so Start works immediately.
+  // Demo convenience: after a reset, preload the 3-truck demo fleet so Start works immediately.
   if (config.method === 'post' && url.pathname === '/simulation/reset' && m.status === 200) {
     try {
-      const csv = await (await fetch('/sample-trucks.csv')).text();
+      const csv = await (await fetch('/demo-trucks.csv')).text();
       const fd = new FormData();
       fd.append('file', new File([csv], 'trucks.csv', { type: 'text/csv' }));
       await adapter({ method: 'post', url: '/upload/trucks', data: fd });
