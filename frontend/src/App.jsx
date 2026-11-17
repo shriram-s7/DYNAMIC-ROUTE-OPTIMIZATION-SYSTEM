@@ -1668,6 +1668,7 @@ function App() {
                   <>
                     <label>Trucks CSV</label>
                     <input type="file" onChange={e => handleFileUpload('trucks', e.target.files[0])} />
+                    {import.meta.env.VITE_DEMO_MODE === 'true' && (<div style={{ fontSize: '12px', color: '#0f5132', background: '#d1e7dd', border: '1px solid #badbcc', borderRadius: '4px', padding: '6px 8px', margin: '6px 0' }}>Demo: 3 trucks (TRUCK001, TRUCK002, TRUCK003) are already loaded. Uploading a CSV is optional and replaces them.</div>)}
                   </>
                 )}
                 {!simulationStarted && (
