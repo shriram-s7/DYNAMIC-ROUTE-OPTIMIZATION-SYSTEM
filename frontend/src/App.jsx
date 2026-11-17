@@ -231,8 +231,9 @@ function App() {
           }
         ]
       },
-      center: [78.9629, 20.5937],
-      zoom: 5
+      // Open on the Trichy Central Depot (CENTRAL_HUB in backend/main.py) so the hubs are in view.
+      center: [78.7047, 10.7905],
+      zoom: 8
     })
     return () => {
       if (map.current) {
@@ -302,6 +303,24 @@ function App() {
       }
     }
   }, [role, addHubMode, placementMode, sensorType, activeMode, worldState, simulationStarted])
+  // When the simulation starts, zoom the map in on the depot and its hubs (once per run),
+  // keeping them clear of the left control panel. Reset/stop re-arms it for the next run.
+  const hasZoomedOnStartRef = useRef(false);
+  useEffect(() => {
+    if (!simulationStarted) { hasZoomedOnStartRef.current = false; return; }
+    if (hasZoomedOnStartRef.current || !map.current || role === 'driver_perspective') return;
+    const pts = (worldState?.hubs ?? []).filter(h => Number.isFinite(h.latitude) && Number.isFinite(h.longitude));
+    if (pts.length === 0) return;
+    hasZoomedOnStartRef.current = true;
+    const bounds = new maplibregl.LngLatBounds();
+    pts.forEach(h => bounds.extend([h.longitude, h.latitude]));
+    const wide = window.innerWidth > 900;
+    map.current.fitBounds(bounds, {
+      padding: { top: 70, bottom: 70, right: 60, left: wide ? 440 : 40 },
+      maxZoom: 10,
+      duration: 2000
+    });
+  }, [simulationStarted, worldState, role]);
   const [driverAutoFollow, setDriverAutoFollow] = useState(true);
   const [driverFollowTimeout, setDriverFollowTimeout] = useState(null);
   useEffect(() => {

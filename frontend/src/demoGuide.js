@@ -30,6 +30,46 @@ function install() {
     };
   };
 
+  // Arms the rain tool if needed, then sends the same map click a visitor would make, on a truck.
+  async function placeRain() {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    if (!state().placing) {
+      if (!state().sensorOpen) { const a = btn('Add Impact'); if (a) { a.click(); await wait(400); } }
+      const r = btn('Add Rain'); if (r) { r.click(); await wait(400); }
+    }
+    // Widen the rain zone so it is clearly visible at this zoom (React-controlled range input).
+    const slider = [...document.querySelectorAll('input[type=range]')].find((x) => x.max === '15');
+    if (slider) {
+      const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      set.call(slider, '15');
+      slider.dispatchEvent(new Event('input', { bubbles: true }));
+      await wait(1500); // the app re-binds its map click handler on its next state refresh
+    }
+    const canvas = document.querySelector('.maplibregl-canvas-container') || document.querySelector('.maplibregl-canvas');
+    if (!canvas) return;
+    // The canvas container itself has no height; measure the actual canvas.
+    const cr = (document.querySelector('.maplibregl-canvas') || canvas).getBoundingClientRect();
+    // Truck markers are the 56px wrappers. The map may still be flying in after Start, so wait
+    // until the truck stops moving on screen before reading its position.
+    const findTruck = () => {
+      const trucks = [...document.querySelectorAll('.maplibregl-marker')].filter((m) => m.style.width === '56px' || (m.firstElementChild && m.firstElementChild.style.width === '56px'));
+      const rects = trucks.map((m) => m.getBoundingClientRect()).filter((q) => q.left > 440 && q.top > 90 && q.right < cr.right && q.bottom < cr.bottom - 80);
+      return rects[0];
+    };
+    let r = findTruck();
+    for (let k = 0; k < 20; k++) {
+      await wait(250);
+      const n = findTruck();
+      const still = r && n && Math.abs(n.left - r.left) < 1 && Math.abs(n.top - r.top) < 1;
+      r = n;
+      if (still) break;
+    }
+    const x = r ? r.left + r.width / 2 : cr.left + cr.width * 0.62;
+    const y = r ? r.top + r.height / 2 : cr.top + cr.height * 0.5;
+    const o = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0, view: window };
+    ['mousedown', 'mouseup', 'click'].forEach((t) => canvas.dispatchEvent(new MouseEvent(t, o)));
+  }
+
   // needs: what must be true for the step to make sense (we step back if the visitor hits Reset).
   const steps = [
     {
@@ -68,7 +108,7 @@ function install() {
     },
     {
       title: '5. Watch the trucks',
-      body: 'Trucks leave the depot and follow <b>real road routes</b> (blue lines) to their hubs. Each truck commits to a destination and only re-plans at safe decision points, like a real dispatcher would.',
+      body: 'The map zooms in for you. Trucks leave the depot and follow <b>real road routes</b> (the blue lines) to their hubs. Each truck commits to a destination and only re-plans at safe decision points, like a real dispatcher would. Scroll or drag the map to look closer.',
       needs: 'started',
       next: 'Next',
     },
@@ -92,17 +132,20 @@ function install() {
     },
     {
       title: '8. Choose rain',
-      body: 'Click <b>🌧 Add Rain</b>. Optionally drag the radius slider to widen the rain area.',
+      body: 'Click <b>🌧 Add Rain</b>. This only <b>arms</b> the tool (the button turns blue and says ON); the rain itself is created in the next step when you click the map. Optionally drag the radius slider first to widen the rain area.',
       target: () => btn('Add Rain'),
       needs: 'started',
       done: (s) => s.placing,
       doIt: () => btn('Add Rain'),
     },
     {
-      title: '9. Drop it on the map',
-      body: 'Now <b>click on the map</b> near a truck or its blue route. Trucks crossing the rain zone slow down, and affected ETAs and risk levels update. Click <b>Next</b> once you have placed it.',
+      title: '9. Drop the rain on the map',
+      body: 'Now <b>click on the map</b>, ideally on a moving truck or its blue route. A pop-up confirms the weather sensor; click <b>OK</b>. A <b>pale blue circle</b> marks the rain zone, and trucks inside it slow down (see <i>Active Environment Impacts</i> in the decisions panel). Not sure where? Press <b>Place it for me</b>: it drops a 15 km rain zone on a truck.',
       needs: 'started',
       next: 'Next',
+      doIt: placeRain,
+      doLabel: 'Place it for me',
+      advanceAfterDo: true,
     },
     {
       title: '10. See the decisions',
@@ -224,7 +267,7 @@ function install() {
         ${i > 0 ? '<button class="dg-b" data-a="back">Back</button>' : ''}
         <span class="sp"></span>
         <button class="dg-link" data-a="skip">${i === steps.length - 1 ? '' : 'Skip tour'}</button>
-        ${s.doIt ? '<button class="dg-b" data-a="do">Do it for me</button>' : ''}
+        ${s.doIt ? `<button class="dg-b" data-a="do">${s.doLabel || 'Do it for me'}</button>` : ''}
         ${s.next ? `<button class="dg-b dg-pri" data-a="next">${s.next}</button>` : ''}
       </div>`;
   }
@@ -235,7 +278,12 @@ function install() {
     if (a === 'back') { i = Math.max(0, i - 1); render(); }
     else if (a === 'next') { if (i === steps.length - 1) close(); else { i++; render(); } }
     else if (a === 'skip') close();
-    else if (a === 'do') { const el = steps[i].doIt(); if (el) el.click(); }
+    else if (a === 'do') {
+      const st = steps[i];
+      const el = st.doIt();
+      if (el && el.click) el.click();
+      if (st.advanceAfterDo) Promise.resolve(el).then(() => setTimeout(() => { if (steps[i] === st) { i = Math.min(steps.length - 1, i + 1); render(); } }, 1500));
+    }
   });
 
   // Keep the highlight on the target and auto-advance when the visitor completes the action.

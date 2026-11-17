@@ -14,7 +14,7 @@ An **interactive guided tour** opens on first visit. It highlights each button t
 
 1. Wait for the "backend running in your browser" notice (first load downloads Python, about 15-30 s). A 3-truck fleet is preloaded.
 2. Click **Create Fixed Hubs** (dismiss the pop-up), then **Start**.
-3. Speed up the clock, click **Add Impact → 🌧 Add Rain** and drop it on the map, and edit hub deadlines or demand.
+3. The map opens on the Trichy depot and zooms in on the depot and hubs when you press Start, so the truck routes are visible. Speed up the clock, click **Add Impact → 🌧 Add Rain** and drop it on the map, and edit hub deadlines or demand.
 4. Click **Driver View**, pick a truck, then **Open in Driver View**. This opens the separate Google-Maps-style navigation window (`driver.html`) that follows the truck live. Allow pop-ups for the site if it does not open.
 
 The simulation state lives in your browser tab and resets on reload. Why a static host works, and how to deploy it yourself: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
