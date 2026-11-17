@@ -852,6 +852,137 @@ def is_fuel_feasible_with_return(truck: Truck, target_hub: Hub) -> bool:
     total_dist = dist_to_hub + dist_back_to_depot
     fuel_needed = total_dist * FUEL_CONSUMPTION_RATE
     return fuel_needed <= truck.fuel_remaining
+def simulation_tick():
+    """Advance the simulation by one step (one iteration of the execution loop)."""
+    world_state.simulation_time += SIMULATION_TIME_STEP
+    for truck in world_state.trucks:
+        if not truck.active:
+            continue
+        if truck.status == "blocked":
+            continue
+        if truck.status == "idle":
+            truck.last_decision_point = world_state.simulation_time
+            if truck.future_task_queue or world_state.simulation_phase in ("committed", "executing"):
+                dispatch_next_committed_task(truck, set_moving_state=True)
+            if truck.current_task:
+                hub = next((h for h in world_state.hubs if h.id == truck.current_task.hub_id), None)
+                if hub:
+                    truck.route = get_road_route(
+                        truck.current_latitude,
+                        truck.current_longitude,
+                        hub.latitude,
+                        hub.longitude
+                    )
+                    truck.full_route = truck.route.copy()
+                    truck.current_route_index = 0
+                    truck.status = "moving"
+                    world_state.ai_decisions.append(
+                        AIDecision(
+                            truck_id=truck.id,
+                            decision="MOVING",
+                            explanation=f"Moving to {hub.name} (Deadline: {hub.deadline_hours}h) - destination LOCKED",
+                            timestamp=world_state.simulation_time
+                        )
+                    )
+        elif truck.status == "moving":
+            time_to_advance = SIMULATION_TIME_STEP
+            while time_to_advance > 0 and truck.route and truck.current_route_index < len(truck.route):
+                next_p = truck.route[truck.current_route_index]
+                seg_time = get_segment_time(truck.current_latitude, truck.current_longitude, 
+                                          next_p["latitude"], next_p["longitude"], 
+                                          truck.id, truck.current_route_index)
+                if seg_time <= 0:
+                    truck.current_route_index += 1
+                    continue
+                if time_to_advance >= seg_time:
+                    time_to_advance -= seg_time
+                    segment_dist = haversine(truck.current_latitude, truck.current_longitude, 
+                                           next_p["latitude"], next_p["longitude"])
+                    truck.fuel_remaining -= segment_dist * FUEL_CONSUMPTION_RATE
+                    truck.current_fuel_used += segment_dist * FUEL_CONSUMPTION_RATE
+                    truck.current_latitude = next_p["latitude"]
+                    truck.current_longitude = next_p["longitude"]
+                    truck.current_route_index += 1
+                else:
+                    fraction = time_to_advance / seg_time
+                    full_seg_dist = haversine(truck.current_latitude, truck.current_longitude, 
+                                            next_p["latitude"], next_p["longitude"])
+                    moved_dist = full_seg_dist * fraction
+                    truck.fuel_remaining -= moved_dist * FUEL_CONSUMPTION_RATE
+                    truck.current_fuel_used += moved_dist * FUEL_CONSUMPTION_RATE
+                    truck.current_latitude += (next_p["latitude"] - truck.current_latitude) * fraction
+                    truck.current_longitude += (next_p["longitude"] - truck.current_longitude) * fraction
+                    time_to_advance = 0
+            if truck.current_route_index >= len(truck.route):
+                if truck.current_task:
+                    hub = next((h for h in world_state.hubs if h.id == truck.current_task.hub_id), None)
+                    if hub:
+                        hub.demand_quantity = max(0, hub.demand_quantity - 1)
+                        if hub.demand_quantity == 0:
+                            release_hub_ownership(hub.id, mark_completed=True)
+                        world_state.ai_decisions.append(
+                            AIDecision(
+                                truck_id=truck.id,
+                                decision="DELIVERED",
+                                explanation=f"Delivered to {hub.name}. Fuel used: {truck.current_fuel_used:.1f}L",
+                                timestamp=world_state.simulation_time
+                            )
+                        )
+                    completed_hub = hub
+                    truck.current_task = None
+                    if world_state.simulation_phase in ("committed", "executing"):
+                        if truck.future_task_queue:
+                            truck.status = "idle" 
+                        else:
+                            truck.route = get_road_route(
+                                truck.current_latitude,
+                                truck.current_longitude,
+                                CENTRAL_HUB["latitude"],
+                                CENTRAL_HUB["longitude"]
+                            )
+                            truck.current_route_index = 0
+                            truck.status = "returning"
+                    else:
+                        truck.status = "idle"
+                else:
+                    truck.status = "idle"
+        elif truck.status == "returning":
+            time_to_advance = SIMULATION_TIME_STEP
+            while time_to_advance > 0 and truck.route and truck.current_route_index < len(truck.route):
+                next_p = truck.route[truck.current_route_index]
+                seg_time = get_segment_time(truck.current_latitude, truck.current_longitude, 
+                                          next_p["latitude"], next_p["longitude"], 
+                                          truck.id, truck.current_route_index)
+                if seg_time <= 0:
+                    truck.current_route_index += 1
+                    continue
+                if time_to_advance >= seg_time:
+                    time_to_advance -= seg_time
+                    truck.current_latitude = next_p["latitude"]
+                    truck.current_longitude = next_p["longitude"]
+                    truck.current_route_index += 1
+                else:
+                    fraction = time_to_advance / seg_time
+                    truck.current_latitude += (next_p["latitude"] - truck.current_latitude) * fraction
+                    truck.current_longitude += (next_p["longitude"] - truck.current_longitude) * fraction
+                    time_to_advance = 0
+            if truck.current_route_index >= len(truck.route):
+                truck.current_latitude = CENTRAL_HUB["latitude"]
+                truck.current_longitude = CENTRAL_HUB["longitude"]
+                truck.fuel_remaining = truck.fuel_capacity
+                truck.current_fuel_used = 0.0
+                truck.route.clear()
+                truck.full_route.clear()
+                truck.current_route_index = 0
+                truck.status = "idle"
+                world_state.ai_decisions.append(
+                    AIDecision(
+                        truck_id=truck.id, 
+                        decision="ARRIVED_AT_DEPOT", 
+                        explanation="Truck arrived at depot and refueled", 
+                        timestamp=world_state.simulation_time
+                    )
+                )
 def simulation_loop():
     """
     CONTINUOUSLY RUNNING EXECUTION LOOP
@@ -871,135 +1002,7 @@ def simulation_loop():
             time.sleep(0.2)
             continue
         time.sleep(0.1 / world_state.simulation_speed)
-        world_state.simulation_time += SIMULATION_TIME_STEP
-        for truck in world_state.trucks:
-            if not truck.active:
-                continue
-            if truck.status == "blocked":
-                continue
-            if truck.status == "idle":
-                truck.last_decision_point = world_state.simulation_time
-                if truck.future_task_queue or world_state.simulation_phase in ("committed", "executing"):
-                    dispatch_next_committed_task(truck, set_moving_state=True)
-                if truck.current_task:
-                    hub = next((h for h in world_state.hubs if h.id == truck.current_task.hub_id), None)
-                    if hub:
-                        truck.route = get_road_route(
-                            truck.current_latitude,
-                            truck.current_longitude,
-                            hub.latitude,
-                            hub.longitude
-                        )
-                        truck.full_route = truck.route.copy()
-                        truck.current_route_index = 0
-                        truck.status = "moving"
-                        world_state.ai_decisions.append(
-                            AIDecision(
-                                truck_id=truck.id,
-                                decision="MOVING",
-                                explanation=f"Moving to {hub.name} (Deadline: {hub.deadline_hours}h) - destination LOCKED",
-                                timestamp=world_state.simulation_time
-                            )
-                        )
-            elif truck.status == "moving":
-                time_to_advance = SIMULATION_TIME_STEP
-                while time_to_advance > 0 and truck.route and truck.current_route_index < len(truck.route):
-                    next_p = truck.route[truck.current_route_index]
-                    seg_time = get_segment_time(truck.current_latitude, truck.current_longitude, 
-                                              next_p["latitude"], next_p["longitude"], 
-                                              truck.id, truck.current_route_index)
-                    if seg_time <= 0:
-                        truck.current_route_index += 1
-                        continue
-                    if time_to_advance >= seg_time:
-                        time_to_advance -= seg_time
-                        segment_dist = haversine(truck.current_latitude, truck.current_longitude, 
-                                               next_p["latitude"], next_p["longitude"])
-                        truck.fuel_remaining -= segment_dist * FUEL_CONSUMPTION_RATE
-                        truck.current_fuel_used += segment_dist * FUEL_CONSUMPTION_RATE
-                        truck.current_latitude = next_p["latitude"]
-                        truck.current_longitude = next_p["longitude"]
-                        truck.current_route_index += 1
-                    else:
-                        fraction = time_to_advance / seg_time
-                        full_seg_dist = haversine(truck.current_latitude, truck.current_longitude, 
-                                                next_p["latitude"], next_p["longitude"])
-                        moved_dist = full_seg_dist * fraction
-                        truck.fuel_remaining -= moved_dist * FUEL_CONSUMPTION_RATE
-                        truck.current_fuel_used += moved_dist * FUEL_CONSUMPTION_RATE
-                        truck.current_latitude += (next_p["latitude"] - truck.current_latitude) * fraction
-                        truck.current_longitude += (next_p["longitude"] - truck.current_longitude) * fraction
-                        time_to_advance = 0
-                if truck.current_route_index >= len(truck.route):
-                    if truck.current_task:
-                        hub = next((h for h in world_state.hubs if h.id == truck.current_task.hub_id), None)
-                        if hub:
-                            hub.demand_quantity = max(0, hub.demand_quantity - 1)
-                            if hub.demand_quantity == 0:
-                                release_hub_ownership(hub.id, mark_completed=True)
-                            world_state.ai_decisions.append(
-                                AIDecision(
-                                    truck_id=truck.id,
-                                    decision="DELIVERED",
-                                    explanation=f"Delivered to {hub.name}. Fuel used: {truck.current_fuel_used:.1f}L",
-                                    timestamp=world_state.simulation_time
-                                )
-                            )
-                        completed_hub = hub
-                        truck.current_task = None
-                        if world_state.simulation_phase in ("committed", "executing"):
-                            if truck.future_task_queue:
-                                truck.status = "idle" 
-                            else:
-                                truck.route = get_road_route(
-                                    truck.current_latitude,
-                                    truck.current_longitude,
-                                    CENTRAL_HUB["latitude"],
-                                    CENTRAL_HUB["longitude"]
-                                )
-                                truck.current_route_index = 0
-                                truck.status = "returning"
-                        else:
-                            truck.status = "idle"
-                    else:
-                        truck.status = "idle"
-            elif truck.status == "returning":
-                time_to_advance = SIMULATION_TIME_STEP
-                while time_to_advance > 0 and truck.route and truck.current_route_index < len(truck.route):
-                    next_p = truck.route[truck.current_route_index]
-                    seg_time = get_segment_time(truck.current_latitude, truck.current_longitude, 
-                                              next_p["latitude"], next_p["longitude"], 
-                                              truck.id, truck.current_route_index)
-                    if seg_time <= 0:
-                        truck.current_route_index += 1
-                        continue
-                    if time_to_advance >= seg_time:
-                        time_to_advance -= seg_time
-                        truck.current_latitude = next_p["latitude"]
-                        truck.current_longitude = next_p["longitude"]
-                        truck.current_route_index += 1
-                    else:
-                        fraction = time_to_advance / seg_time
-                        truck.current_latitude += (next_p["latitude"] - truck.current_latitude) * fraction
-                        truck.current_longitude += (next_p["longitude"] - truck.current_longitude) * fraction
-                        time_to_advance = 0
-                if truck.current_route_index >= len(truck.route):
-                    truck.current_latitude = CENTRAL_HUB["latitude"]
-                    truck.current_longitude = CENTRAL_HUB["longitude"]
-                    truck.fuel_remaining = truck.fuel_capacity
-                    truck.current_fuel_used = 0.0
-                    truck.route.clear()
-                    truck.full_route.clear()
-                    truck.current_route_index = 0
-                    truck.status = "idle"
-                    world_state.ai_decisions.append(
-                        AIDecision(
-                            truck_id=truck.id, 
-                            decision="ARRIVED_AT_DEPOT", 
-                            explanation="Truck arrived at depot and refueled", 
-                            timestamp=world_state.simulation_time
-                        )
-                    )
+        simulation_tick()
 @app.post("/upload/hubs")
 async def upload_hubs(file: UploadFile = File(...)):
     text = (await file.read()).decode()
@@ -1366,10 +1369,9 @@ async def create_random_hubs():
     # Auto-seed trucks for immediate testing with fixed hubs
     if not world_state.trucks:
         print("[INFO] Seeding default trucks for testing")
-        from backend.main import Truck
         world_state.trucks = [
-            Truck(id="TRK1", current_latitude=CENTRAL_HUB["latitude"], current_longitude=CENTRAL_HUB["longitude"], speed_kmph=GLOBAL_SPEED_KMPH),
-            Truck(id="TRK2", current_latitude=CENTRAL_HUB["latitude"], current_longitude=CENTRAL_HUB["longitude"], speed_kmph=GLOBAL_SPEED_KMPH)
+            Truck(id="TRK1", starting_latitude=CENTRAL_HUB["latitude"], starting_longitude=CENTRAL_HUB["longitude"], current_latitude=CENTRAL_HUB["latitude"], current_longitude=CENTRAL_HUB["longitude"], fuel_capacity=100.0, fuel_remaining=100.0, speed_kmph=GLOBAL_SPEED_KMPH),
+            Truck(id="TRK2", starting_latitude=CENTRAL_HUB["latitude"], starting_longitude=CENTRAL_HUB["longitude"], current_latitude=CENTRAL_HUB["latitude"], current_longitude=CENTRAL_HUB["longitude"], fuel_capacity=100.0, fuel_remaining=100.0, speed_kmph=GLOBAL_SPEED_KMPH)
         ]
 
     if world_state.simulation_running:
