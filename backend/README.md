@@ -11,6 +11,8 @@ python main.py
 
 Server runs on `http://localhost:8000`
 
+A hosted demo runs this same backend in the browser (Pyodide); see [`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md). The simulation step is the function `simulation_tick()`, which both the local thread loop and the demo call.
+
 ## API Endpoints
 
 - `GET /` - API info

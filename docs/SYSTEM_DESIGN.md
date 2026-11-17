@@ -4,12 +4,16 @@
 
 The system follows a client-server architecture with a Python FastAPI backend and React frontend, communicating via REST API with polling-based state synchronization.
 
+### Hosted demo variant
+
+The live demo (https://optiflow-dro.vercel.app) keeps this same architecture but moves the "server" into the browser: the unmodified backend runs in a web worker on Pyodide (WebAssembly) and the frontend's API calls are routed to it instead of `http://localhost:8000`. The simulation loop body is exposed as `simulation_tick()` so the worker can drive it without a thread. Details: [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ## Backend Design
 
 ### State Management
 - **Single Global State**: `WorldState` object holds all simulation data in memory
 - **No Persistence**: Designed for demo/prototype - restart loses state
-- **Thread-Safe Simulation**: Background thread runs simulation loop independently
+- **Thread-Safe Simulation**: Background thread runs simulation loop independently (each step is `simulation_tick()`; the hosted demo calls it from a worker timer instead of a thread)
 
 ### Simulation Engine
 - **Time-Based Loop**: Advances simulation every 1 second
